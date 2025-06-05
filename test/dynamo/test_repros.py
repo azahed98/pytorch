@@ -6264,6 +6264,14 @@ def forward(self, s77 : torch.SymInt, s27 : torch.SymInt, L_x_ : torch.Tensor):
         opt_fn = torch.compile(fn, backend="eager", fullgraph=True)
         self.assertEqual(fn(config, x), opt_fn(config, x))
 
+    # https://github.com/pytorch/pytorch/issues/146274
+    def test_one_hot_non_positive(self):
+        for backend in ["inductor", "eager"]:
+            one_hot_fn = torch.compile(torch.nn.functional.one_hot, backend=backend)
+
+            with self.assertRaisesRegex(RuntimeError, "num_classes"):
+                one_hot_fn(torch.arange(0, 3), 0)
+
     # https://github.com/pytorch/pytorch/issues/136257
     def test_overwriting_params(self):
         class M(torch.nn.Module):
