@@ -1,55 +1,20 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates
 # Owner(s): ["oncall: distributed"]
 
-import contextlib
-import copy
-import functools
-import unittest
-from unittest.mock import patch
-
 import torch
 import torch._dynamo
 import torch._dynamo.testing
 import torch.distributed as dist
-import torch.nn as nn
-from torch._C import FileCheck
-from torch._inductor.utils import run_and_get_triton_code
-from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
-    checkpoint_wrapper,
-    CheckpointImpl,
-)
-from torch.distributed.device_mesh import init_device_mesh
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from torch.distributed.tensor import DeviceMesh, DTensor, Partial, Replicate, Shard
-from torch.distributed.tensor._dtensor_spec import DTensorSpec, TensorMeta
-from torch.distributed.tensor.parallel import (
-    ColwiseParallel,
-    parallelize_module,
-    PrepareModuleInput,
-    PrepareModuleOutput,
-    RowwiseParallel,
-)
-from torch.distributed.tensor.placement_types import _StridedShard
-from torch.testing._internal.common_distributed import skip_if_lt_x_gpu
-from torch.testing._internal.common_fsdp import get_devtype
+
+from torch.distributed.tensor import DeviceMesh, DTensor, Replicate, Shard
 from torch.testing._internal.common_utils import (
-    instantiate_parametrized_tests,
-    parametrize,
     run_tests,
     skipIfHpu,
-    skipIfTorchDynamo,
     TEST_CUDA,
     TEST_HPU,
 )
-from torch.testing._internal.distributed._tensor.common_dtensor import (
-    DTensorTestBase,
-    MLPModule,
-    with_comms,
-)
+
 from torch.testing._internal.distributed.fake_pg import FakeStore
-from torch.testing._internal.inductor_utils import HAS_GPU
-from torch.testing._internal.two_tensor import TwoTensor
-from torch.utils.checkpoint import checkpoint
 
 aten = torch.ops.aten
 
