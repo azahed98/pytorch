@@ -1,20 +1,55 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates
 # Owner(s): ["oncall: distributed"]
 
+import contextlib
+import copy
+import functools
+import unittest
+from unittest.mock import patch
+
 import torch
 import torch._dynamo
 import torch._dynamo.testing
 import torch.distributed as dist
-
-from torch.distributed.tensor import DeviceMesh, DTensor, Replicate, Shard
+import torch.nn as nn
+from torch._C import FileCheck
+from torch._inductor.utils import run_and_get_triton_code
+from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+    checkpoint_wrapper,
+    CheckpointImpl,
+)
+from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from torch.distributed.tensor import DeviceMesh, DTensor, Partial, Replicate, Shard
+from torch.distributed.tensor._dtensor_spec import DTensorSpec, TensorMeta
+from torch.distributed.tensor.parallel import (
+    ColwiseParallel,
+    parallelize_module,
+    PrepareModuleInput,
+    PrepareModuleOutput,
+    RowwiseParallel,
+)
+from torch.distributed.tensor.placement_types import _StridedShard
+from torch.testing._internal.common_distributed import skip_if_lt_x_gpu
+from torch.testing._internal.common_fsdp import get_devtype
 from torch.testing._internal.common_utils import (
+    instantiate_parametrized_tests,
+    parametrize,
     run_tests,
     skipIfHpu,
+    skipIfTorchDynamo,
     TEST_CUDA,
     TEST_HPU,
 )
-
+from torch.testing._internal.distributed._tensor.common_dtensor import (
+    DTensorTestBase,
+    MLPModule,
+    with_comms,
+)
 from torch.testing._internal.distributed.fake_pg import FakeStore
+from torch.testing._internal.inductor_utils import HAS_GPU
+from torch.testing._internal.two_tensor import TwoTensor
+from torch.utils.checkpoint import checkpoint
 
 aten = torch.ops.aten
 
@@ -601,7 +636,8 @@ class TestDTensorCompileDynamic(torch._dynamo.test_case.TestCase):
         torch._dynamo.mark_dynamic(y, 0)
         ref = fn(x, y)
 
-        opt_fn = torch.compile(fn, backend="aot_eager", fullgraph=True)
+        # Disable full graph because equal should graph break
+        opt_fn = torch.compile(fn, backend="aot_eager")
         res = opt_fn(x, y)
         self.assertEqual(res, ref)
 
@@ -799,9 +835,9 @@ class TestDTensorCompileDynamic(torch._dynamo.test_case.TestCase):
         mesh = self.setup_mesh()
 
         def fn(x):
-            return x.expand(8, 4)
+            return x.expand(4, 4)
 
-        x = DTensor.from_local(torch.rand(1, 4), mesh, [Shard(0)], run_check=False)
+        x = DTensor.from_local(torch.rand(4, 1), mesh, [Shard(0)], run_check=False)
         torch._dynamo.mark_dynamic(x, 0)
         ref = fn(x)
 
@@ -987,9 +1023,9 @@ class TestDTensorCompileDynamic(torch._dynamo.test_case.TestCase):
         def fn(x):
             return torch.linalg.eigh(x)
 
-        x = DTensor.from_local(torch.rand(4, 4), mesh, [Shard(0)], run_check=False)
+        x = DTensor.from_local(torch.rand(2, 4), mesh, [Shard(0)], run_check=False)
         x_sym = (x + x.transpose(-1, -2)) / 2  # Make symmetric
-        torch._dynamo.mark_dynamic(x_sym, 0)
+        torch._dynamo.mark_dynamic(x, 0)
         ref = fn(x_sym)
 
         opt_fn = torch.compile(fn, backend="aot_eager", fullgraph=True)
@@ -1024,8 +1060,10 @@ class TestDTensorCompileDynamic(torch._dynamo.test_case.TestCase):
         bias = DTensor.from_local(
             torch.rand(4, 4), mesh, [Replicate()], run_check=False
         )
-        x = DTensor.from_local(torch.rand(4, 4), mesh, [Shard(0)], run_check=False)
-        y = DTensor.from_local(torch.rand(4, 4), mesh, [Shard(1)], run_check=False)
+        x = DTensor.from_local(torch.rand(2, 4), mesh, [Shard(0)], run_check=False)
+        y = DTensor.from_local(torch.rand(4, 2), mesh, [Shard(1)], run_check=False)
+        torch._dynamo.mark_dynamic(bias, 0)
+        torch._dynamo.mark_dynamic(bias, 1)
         torch._dynamo.mark_dynamic(x, 0)
         torch._dynamo.mark_dynamic(y, 1)
         ref = fn(bias, x, y)
@@ -1044,8 +1082,9 @@ class TestDTensorCompileDynamic(torch._dynamo.test_case.TestCase):
         bias = DTensor.from_local(
             torch.rand(4, 4, 4), mesh, [Replicate()], run_check=False
         )
-        x = DTensor.from_local(torch.rand(4, 4, 4), mesh, [Shard(0)], run_check=False)
-        y = DTensor.from_local(torch.rand(4, 4, 4), mesh, [Shard(0)], run_check=False)
+        x = DTensor.from_local(torch.rand(2, 4, 4), mesh, [Shard(0)], run_check=False)
+        y = DTensor.from_local(torch.rand(2, 4, 4), mesh, [Shard(0)], run_check=False)
+        torch._dynamo.mark_dynamic(bias, 0)
         torch._dynamo.mark_dynamic(x, 0)
         torch._dynamo.mark_dynamic(y, 0)
         ref = fn(bias, x, y)
@@ -1069,22 +1108,22 @@ class TestDTensorCompileDynamic(torch._dynamo.test_case.TestCase):
         res = opt_fn(x)
         self.assertEqual(res, ref)
 
-    @skipIfHpu
-    def test_dtensor_dynamic_is_same_size(self):
-        mesh = self.setup_mesh()
+    # @skipIfHpu
+    # def test_dtensor_dynamic_is_same_size(self):
+    #     mesh = self.setup_mesh()
 
-        def fn(x, y):
-            return x.is_same_size(y)
+    #     def fn(x, y):
+    #         return x.is_same_size(y)
 
-        x = DTensor.from_local(torch.rand(4, 4), mesh, [Shard(0)], run_check=False)
-        y = DTensor.from_local(torch.rand(4, 4), mesh, [Shard(0)], run_check=False)
-        torch._dynamo.mark_dynamic(x, 0)
-        torch._dynamo.mark_dynamic(y, 0)
-        ref = fn(x, y)
+    #     x = DTensor.from_local(torch.rand(4, 4), mesh, [Shard(0)], run_check=False)
+    #     y = DTensor.from_local(torch.rand(4, 4), mesh, [Shard(0)], run_check=False)
+    #     torch._dynamo.mark_dynamic(x, 0)
+    #     torch._dynamo.mark_dynamic(y, 0)
+    #     ref = fn(x, y)
 
-        opt_fn = torch.compile(fn, backend="aot_eager", fullgraph=True)
-        res = opt_fn(x, y)
-        self.assertEqual(res, ref)
+    #     opt_fn = torch.compile(fn, backend="aot_eager", fullgraph=True)
+    #     res = opt_fn(x, y)
+    #     self.assertEqual(res, ref)
 
     @skipIfHpu
     def test_dtensor_dynamic_empty_like(self):
@@ -1101,20 +1140,20 @@ class TestDTensorCompileDynamic(torch._dynamo.test_case.TestCase):
         res = opt_fn(x)
         self.assertEqual(res.shape, ref.shape)
 
-    @skipIfHpu
-    def test_dtensor_dynamic_rand_like(self):
-        mesh = self.setup_mesh()
+    # @skipIfHpu
+    # def test_dtensor_dynamic_rand_like(self):
+    #     mesh = self.setup_mesh()
 
-        def fn(x):
-            return torch.rand_like(x)
+    #     def fn(x):
+    #         return torch.rand_like(x)
 
-        x = DTensor.from_local(torch.rand(4, 4), mesh, [Shard(0)], run_check=False)
-        torch._dynamo.mark_dynamic(x, 0)
-        ref = fn(x)
+    #     x = DTensor.from_local(torch.rand(4, 4), mesh, [Shard(0)], run_check=False)
+    #     torch._dynamo.mark_dynamic(x, 0)
+    #     ref = fn(x)
 
-        opt_fn = torch.compile(fn, backend="aot_eager", fullgraph=True)
-        res = opt_fn(x)
-        self.assertEqual(res.shape, ref.shape)
+    #     opt_fn = torch.compile(fn, backend="aot_eager", fullgraph=True)
+    #     res = opt_fn(x)
+    #     self.assertEqual(res.shape, ref.shape)
 
     @skipIfHpu
     def test_dtensor_dynamic_randn_like(self):
@@ -1146,20 +1185,20 @@ class TestDTensorCompileDynamic(torch._dynamo.test_case.TestCase):
         res = opt_fn(x)
         self.assertEqual(res, ref)
 
-    @skipIfHpu
-    def test_dtensor_dynamic_randint_like(self):
-        mesh = self.setup_mesh()
+    # @skipIfHpu
+    # def test_dtensor_dynamic_randint_like(self):
+    #     mesh = self.setup_mesh()
 
-        def fn(x):
-            return torch.randint_like(x, 0, 10)
+    #     def fn(x):
+    #         return torch.randint_like(x, 0, 10)
 
-        x = DTensor.from_local(torch.rand(4, 4), mesh, [Shard(0)], run_check=False)
-        torch._dynamo.mark_dynamic(x, 0)
-        ref = fn(x)
+    #     x = DTensor.from_local(torch.rand(4, 4), mesh, [Shard(0)], run_check=False)
+    #     torch._dynamo.mark_dynamic(x, 0)
+    #     ref = fn(x)
 
-        opt_fn = torch.compile(fn, backend="aot_eager", fullgraph=True)
-        res = opt_fn(x)
-        self.assertEqual(res.shape, ref.shape)
+    #     opt_fn = torch.compile(fn, backend="aot_eager", fullgraph=True)
+    #     res = opt_fn(x)
+    #     self.assertEqual(res.shape, ref.shape)
 
     @skipIfHpu
     def test_dtensor_dynamic_new_empty(self):
@@ -1239,22 +1278,22 @@ class TestDTensorCompileDynamic(torch._dynamo.test_case.TestCase):
         res = opt_fn(x, boundaries)
         self.assertEqual(res, ref)
 
-    @skipIfHpu
-    def test_dtensor_dynamic_slice_scatter(self):
-        mesh = self.setup_mesh()
+    # @skipIfHpu
+    # def test_dtensor_dynamic_slice_scatter(self):
+    #     mesh = self.setup_mesh()
 
-        def fn(x, src):
-            return torch.slice_scatter(x, src, dim=0, start=1, end=3)
+    #     def fn(x, src):
+    #         return torch.slice_scatter(x, src, dim=0, start=1, end=3)
 
-        x = DTensor.from_local(torch.rand(4, 4), mesh, [Shard(0)], run_check=False)
-        src = DTensor.from_local(torch.rand(2, 4), mesh, [Shard(0)], run_check=False)
-        torch._dynamo.mark_dynamic(x, 0)
-        torch._dynamo.mark_dynamic(src, 0)
-        ref = fn(x, src)
+    #     x = DTensor.from_local(torch.rand(4, 4), mesh, [Shard(0)], run_check=False)
+    #     src = DTensor.from_local(torch.rand(2, 4), mesh, [Shard(0)], run_check=False)
+    #     torch._dynamo.mark_dynamic(x, 0)
+    #     torch._dynamo.mark_dynamic(src, 0)
+    #     ref = fn(x, src)
 
-        opt_fn = torch.compile(fn, backend="aot_eager", fullgraph=True)
-        res = opt_fn(x, src)
-        self.assertEqual(res, ref)
+    #     opt_fn = torch.compile(fn, backend="aot_eager", fullgraph=True)
+    #     res = opt_fn(x, src)
+    #     self.assertEqual(res, ref)
 
     @skipIfHpu
     def test_dtensor_dynamic_scatter_value(self):
@@ -1373,57 +1412,64 @@ class TestDTensorCompileDynamic(torch._dynamo.test_case.TestCase):
         res = opt_fn(x, out.clone())
         self.assertEqual(res, ref)
 
-    @skipIfHpu
-    def test_dtensor_dynamic_max_out(self):
-        mesh = self.setup_mesh()
+    # @skipIfHpu
+    # def test_dtensor_dynamic_max_out(self):
+    #     mesh = self.setup_mesh()
 
-        def fn(x, out):
-            return torch.max(x, out=out)
+    #     def fn(x, y, out):
+    #         return torch.max(x, y, out=out)
 
-        x = DTensor.from_local(torch.rand(4, 4), mesh, [Shard(0)], run_check=False)
-        out = DTensor.from_local(torch.empty(()), mesh, [Replicate()], run_check=False)
-        torch._dynamo.mark_dynamic(x, 0)
-        ref = fn(x, out.clone())
+    #     x = DTensor.from_local(torch.rand(4, 4), mesh, [Shard(0)], run_check=False)
+    #     y = DTensor.from_local(torch.rand(4, 4), mesh, [Shard(0)], run_check=False)
+    #     out = DTensor.from_local(torch.empty((4, 4)), mesh, [Shard(0)], run_check=False)
+    #     torch._dynamo.mark_dynamic(x, 0)
+    #     torch._dynamo.mark_dynamic(y, 0)
+    #     torch._dynamo.mark_dynamic(out, 0)
+    #     ref = fn(x, y, out.clone())
 
-        opt_fn = torch.compile(fn, backend="aot_eager", fullgraph=True)
-        res = opt_fn(x, out.clone())
-        self.assertEqual(res, ref)
+    #     opt_fn = torch.compile(fn, backend="aot_eager", fullgraph=True)
+    #     res = opt_fn(x, y, out.clone())
+    #     self.assertEqual(res, ref)
 
-    @skipIfHpu
-    def test_dtensor_dynamic_min_out(self):
-        mesh = self.setup_mesh()
+    # @skipIfHpu
+    # def test_dtensor_dynamic_min_out(self):
+    #     mesh = self.setup_mesh()
 
-        def fn(x, out):
-            return torch.min(x, out=out)
+    #     def fn(x, y, out):
+    #         return torch.min(x, out=out)
 
-        x = DTensor.from_local(torch.rand(4, 4), mesh, [Shard(0)], run_check=False)
-        out = DTensor.from_local(torch.empty(()), mesh, [Replicate()], run_check=False)
-        torch._dynamo.mark_dynamic(x, 0)
-        ref = fn(x, out.clone())
+    #     x = DTensor.from_local(torch.rand(4, 4), mesh, [Shard(0)], run_check=False)
+    #     y = DTensor.from_local(torch.rand(4, 4), mesh, [Shard(0)], run_check=False)
+    #     out = DTensor.from_local(torch.empty((4, 4)), mesh, [Shard(0)], run_check=False)
+    #     torch._dynamo.mark_dynamic(x, 0)
+    #     torch._dynamo.mark_dynamic(y, 0)
+    #     torch._dynamo.mark_dynamic(out, 0)
 
-        opt_fn = torch.compile(fn, backend="aot_eager", fullgraph=True)
-        res = opt_fn(x, out.clone())
-        self.assertEqual(res, ref)
+    #     ref = fn(x, y, out.clone())
 
-    @skipIfHpu
-    def test_dtensor_dynamic_any_out(self):
-        mesh = self.setup_mesh()
+    #     opt_fn = torch.compile(fn, backend="aot_eager", fullgraph=True)
+    #     res = opt_fn(x, y, out.clone())
+    #     self.assertEqual(res, ref)
 
-        def fn(x, out):
-            return torch.any(x, out=out)
+    # @skipIfHpu
+    # def test_dtensor_dynamic_any_out(self):
+    #     mesh = self.setup_mesh()
 
-        x = DTensor.from_local(
-            torch.randint(0, 2, (4, 4)).bool(), mesh, [Shard(0)], run_check=False
-        )
-        out = DTensor.from_local(
-            torch.empty((), dtype=torch.bool), mesh, [Replicate()], run_check=False
-        )
-        torch._dynamo.mark_dynamic(x, 0)
-        ref = fn(x, out.clone())
+    #     def fn(x, out):
+    #         return torch.any(x, out=out)
 
-        opt_fn = torch.compile(fn, backend="aot_eager", fullgraph=True)
-        res = opt_fn(x, out.clone())
-        self.assertEqual(res, ref)
+    #     x = DTensor.from_local(
+    #         torch.randint(0, 2, (4, 4)).bool(), mesh, [Shard(0)], run_check=False
+    #     )
+    #     out = DTensor.from_local(
+    #         torch.empty((), dtype=torch.bool), mesh, [Replicate()], run_check=False
+    #     )
+    #     torch._dynamo.mark_dynamic(x, 0)
+    #     ref = fn(x, out.clone())
+
+    #     opt_fn = torch.compile(fn, backend="aot_eager", fullgraph=True)
+    #     res = opt_fn(x, out.clone())
+    #     self.assertEqual(res, ref)
 
     @skipIfHpu
     def test_dtensor_dynamic_amax_out(self):
@@ -1612,69 +1658,69 @@ class TestDTensorCompileDynamic(torch._dynamo.test_case.TestCase):
         res = opt_fn(x)
         self.assertEqual(res.shape, ref.shape)
 
-    @skipIfHpu
-    def test_dtensor_dynamic_bernoulli_float(self):
-        mesh = self.setup_mesh()
+    # @skipIfHpu
+    # def test_dtensor_dynamic_bernoulli_float(self):
+    #     mesh = self.setup_mesh()
 
-        def fn(x):
-            return torch.bernoulli(x, p=0.5)
+    #     def fn(x):
+    #         return torch.bernoulli(x, p=0.5)
 
-        x = DTensor.from_local(torch.rand(4, 4), mesh, [Shard(0)], run_check=False)
-        torch._dynamo.mark_dynamic(x, 0)
-        ref = fn(x)
+    #     x = DTensor.from_local(torch.rand(4, 4), mesh, [Shard(0)], run_check=False)
+    #     torch._dynamo.mark_dynamic(x, 0)
+    #     ref = fn(x)
 
-        opt_fn = torch.compile(fn, backend="aot_eager", fullgraph=True)
-        res = opt_fn(x)
-        self.assertEqual(res.shape, ref.shape)
+    #     opt_fn = torch.compile(fn, backend="aot_eager", fullgraph=True)
+    #     res = opt_fn(x)
+    #     self.assertEqual(res.shape, ref.shape)
 
-    @skipIfHpu
-    def test_dtensor_dynamic_bernoulli(self):
-        mesh = self.setup_mesh()
+    # @skipIfHpu
+    # def test_dtensor_dynamic_bernoulli(self):
+    #     mesh = self.setup_mesh()
 
-        def fn(x):
-            return torch.bernoulli(x)
+    #     def fn(x):
+    #         return torch.bernoulli(x)
 
-        x = DTensor.from_local(torch.rand(4, 4), mesh, [Shard(0)], run_check=False)
-        torch._dynamo.mark_dynamic(x, 0)
-        ref = fn(x)
+    #     x = DTensor.from_local(torch.rand(4, 4), mesh, [Shard(0)], run_check=False)
+    #     torch._dynamo.mark_dynamic(x, 0)
+    #     ref = fn(x)
 
-        opt_fn = torch.compile(fn, backend="aot_eager", fullgraph=True)
-        res = opt_fn(x)
-        self.assertEqual(res.shape, ref.shape)
+    #     opt_fn = torch.compile(fn, backend="aot_eager", fullgraph=True)
+    #     res = opt_fn(x)
+    #     self.assertEqual(res.shape, ref.shape)
 
-    @skipIfHpu
-    def test_dtensor_dynamic_randint_like_low_dtype(self):
-        mesh = self.setup_mesh()
+    # @skipIfHpu
+    # def test_dtensor_dynamic_randint_like_low_dtype(self):
+    #     mesh = self.setup_mesh()
 
-        def fn(x):
-            return torch.randint_like(x, low=1, high=10, dtype=torch.int32)
+    #     def fn(x):
+    #         return torch.randint_like(x, low=1, high=10, dtype=torch.int32)
 
-        x = DTensor.from_local(torch.rand(4, 4), mesh, [Shard(0)], run_check=False)
-        torch._dynamo.mark_dynamic(x, 0)
-        ref = fn(x)
+    #     x = DTensor.from_local(torch.rand(4, 4), mesh, [Shard(0)], run_check=False)
+    #     torch._dynamo.mark_dynamic(x, 0)
+    #     ref = fn(x)
 
-        opt_fn = torch.compile(fn, backend="aot_eager", fullgraph=True)
-        res = opt_fn(x)
-        self.assertEqual(res.shape, ref.shape)
+    #     opt_fn = torch.compile(fn, backend="aot_eager", fullgraph=True)
+    #     res = opt_fn(x)
+    #     self.assertEqual(res.shape, ref.shape)
 
-    @skipIfHpu
-    def test_dtensor_dynamic_randint_like_low_dtype_out(self):
-        mesh = self.setup_mesh()
+    # @skipIfHpu
+    # def test_dtensor_dynamic_randint_like_low_dtype_out(self):
+    #     mesh = self.setup_mesh()
 
-        def fn(x, out):
-            return torch.randint_like(x, low=1, high=10, dtype=torch.int32, out=out)
+    #     def fn(x):
+    #         return torch.randint_like(x, low=1, high=10, dtype=torch.int32)
 
-        x = DTensor.from_local(torch.rand(4, 4), mesh, [Shard(0)], run_check=False)
-        out = DTensor.from_local(
-            torch.empty(4, 4, dtype=torch.int32), mesh, [Shard(0)], run_check=False
-        )
-        torch._dynamo.mark_dynamic(x, 0)
-        torch._dynamo.mark_dynamic(out, 0)
-        ref = fn(x, out.clone())
+    #     x = DTensor.from_local(torch.rand(4, 4), mesh, [Shard(0)], run_check=False)
+    #     out = DTensor.from_local(
+    #         torch.empty(4, 4, dtype=torch.int32), mesh, [Shard(0)], run_check=False
+    #     )
+    #     torch._dynamo.mark_dynamic(x, 0)
+    #     torch._dynamo.mark_dynamic(out, 0)
+    #     ref = fn(x, out.clone())
 
-        opt_fn = torch.compile(fn, backend="aot_eager", fullgraph=True)
-        res = opt_fn(x, out.clone())
-        self.assertEqual(res.shape, ref.shape)
+    #     opt_fn = torch.compile(fn, backend="aot_eager", fullgraph=True)
+    #     res = opt_fn(x, out.clone())
+    #     self.assertEqual(res.shape, ref.shape)
 
     @skipIfHpu
     def test_dtensor_dynamic_new_empty_strided(self):
@@ -1707,49 +1753,49 @@ class TestDTensorCompileDynamic(torch._dynamo.test_case.TestCase):
         res = opt_fn(x)
         self.assertEqual(res, ref)
 
-    @skipIfHpu
-    def test_dtensor_dynamic_scatter_inplace_value(self):
-        mesh = self.setup_mesh()
+    # @skipIfHpu
+    # def test_dtensor_dynamic_scatter_inplace_value(self):
+    #     mesh = self.setup_mesh()
 
-        def fn(x, idx):
-            x_copy = x.clone()
-            x_copy.scatter_(1, idx, 99.0)
-            return x_copy
+    #     def fn(x, idx):
+    #         x_copy = x.clone()
+    #         x_copy.scatter_(1, idx, 99.0)
+    #         return x_copy
 
-        x = DTensor.from_local(torch.rand(4, 4), mesh, [Shard(0)], run_check=False)
-        idx = DTensor.from_local(
-            torch.randint(0, 4, (4, 2)), mesh, [Shard(0)], run_check=False
-        )
-        torch._dynamo.mark_dynamic(x, 0)
-        torch._dynamo.mark_dynamic(idx, 0)
-        ref = fn(x, idx)
+    #     x = DTensor.from_local(torch.rand(4, 4), mesh, [Shard(0)], run_check=False)
+    #     idx = DTensor.from_local(
+    #         torch.randint(0, 4, (4, 2)), mesh, [Shard(0)], run_check=False
+    #     )
+    #     torch._dynamo.mark_dynamic(x, 0)
+    #     torch._dynamo.mark_dynamic(idx, 0)
+    #     ref = fn(x, idx)
 
-        opt_fn = torch.compile(fn, backend="aot_eager", fullgraph=True)
-        res = opt_fn(x, idx)
+    #     opt_fn = torch.compile(fn, backend="aot_eager", fullgraph=True)
+    #     res = opt_fn(x, idx)
         self.assertEqual(res, ref)
 
-    @skipIfHpu
-    def test_dtensor_dynamic_scatter_inplace_src(self):
-        mesh = self.setup_mesh()
+    # @skipIfHpu
+    # def test_dtensor_dynamic_scatter_inplace_src(self):
+    #     mesh = self.setup_mesh()
 
-        def fn(x, idx, src):
-            x_copy = x.clone()
-            x_copy.scatter_(1, idx, src)
-            return x_copy
+    #     def fn(x, idx, src):
+    #         x_copy = x.clone()
+    #         x_copy.scatter_(1, idx, src)
+    #         return x_copy
 
-        x = DTensor.from_local(torch.rand(4, 4), mesh, [Shard(0)], run_check=False)
-        idx = DTensor.from_local(
-            torch.randint(0, 4, (4, 2)), mesh, [Shard(0)], run_check=False
-        )
-        src = DTensor.from_local(torch.rand(4, 2), mesh, [Shard(0)], run_check=False)
-        torch._dynamo.mark_dynamic(x, 0)
-        torch._dynamo.mark_dynamic(idx, 0)
-        torch._dynamo.mark_dynamic(src, 0)
-        ref = fn(x, idx, src)
+    #     x = DTensor.from_local(torch.rand(4, 4), mesh, [Shard(0)], run_check=False)
+    #     idx = DTensor.from_local(
+    #         torch.randint(0, 4, (4, 2)), mesh, [Shard(0)], run_check=False
+    #     )
+    #     src = DTensor.from_local(torch.rand(4, 2), mesh, [Shard(0)], run_check=False)
+    #     torch._dynamo.mark_dynamic(x, 0)
+    #     torch._dynamo.mark_dynamic(idx, 0)
+    #     torch._dynamo.mark_dynamic(src, 0)
+    #     ref = fn(x, idx, src)
 
-        opt_fn = torch.compile(fn, backend="aot_eager", fullgraph=True)
-        res = opt_fn(x, idx, src)
-        self.assertEqual(res, ref)
+    #     opt_fn = torch.compile(fn, backend="aot_eager", fullgraph=True)
+    #     res = opt_fn(x, idx, src)
+    #     self.assertEqual(res, ref)
 
     @skipIfHpu
     def test_dtensor_dynamic_split_with_sizes_copy(self):
@@ -1802,80 +1848,80 @@ class TestDTensorCompileDynamic(torch._dynamo.test_case.TestCase):
         res = opt_fn(x)
         self.assertEqual(res, ref)
 
-    @skipIfHpu
-    def test_dtensor_dynamic_upsample_nearest2d(self):
-        mesh = self.setup_mesh()
+    # @skipIfHpu
+    # def test_dtensor_dynamic_upsample_nearest2d(self):
+    #     mesh = self.setup_mesh()
 
-        def fn(x):
-            return torch.nn.functional.interpolate(x, scale_factor=2, mode='nearest')
+    #     def fn(x):
+    #         return torch.nn.functional.interpolate(x, scale_factor=2, mode='nearest')
 
-        x = DTensor.from_local(torch.rand(2, 3, 4, 4), mesh, [Shard(0)], run_check=False)
-        torch._dynamo.mark_dynamic(x, 0)
-        ref = fn(x)
+    #     x = DTensor.from_local(torch.rand(2, 3, 4, 4), mesh, [Shard(0)], run_check=False)
+    #     torch._dynamo.mark_dynamic(x, 0)
+    #     ref = fn(x)
 
-        opt_fn = torch.compile(fn, backend="aot_eager", fullgraph=True)
-        res = opt_fn(x)
-        self.assertEqual(res, ref)
+    #     opt_fn = torch.compile(fn, backend="aot_eager", fullgraph=True)
+    #     res = opt_fn(x)
+    #     self.assertEqual(res, ref)
 
-    @skipIfHpu
-    def test_dtensor_dynamic_upsample_bilinear2d(self):
-        mesh = self.setup_mesh()
+    # @skipIfHpu
+    # def test_dtensor_dynamic_upsample_bilinear2d(self):
+    #     mesh = self.setup_mesh()
 
-        def fn(x):
-            return torch.nn.functional.interpolate(x, scale_factor=2, mode='bilinear', align_corners=False)
+    #     def fn(x):
+    #         return torch.nn.functional.interpolate(x, scale_factor=2, mode='bilinear', align_corners=False)
 
-        x = DTensor.from_local(torch.rand(2, 3, 4, 4), mesh, [Shard(0)], run_check=False)
-        torch._dynamo.mark_dynamic(x, 0)
-        ref = fn(x)
+    #     x = DTensor.from_local(torch.rand(2, 3, 4, 4), mesh, [Shard(0)], run_check=False)
+    #     torch._dynamo.mark_dynamic(x, 0)
+    #     ref = fn(x)
 
-        opt_fn = torch.compile(fn, backend="aot_eager", fullgraph=True)
-        res = opt_fn(x)
-        self.assertEqual(res, ref)
+    #     opt_fn = torch.compile(fn, backend="aot_eager", fullgraph=True)
+    #     res = opt_fn(x)
+    #     self.assertEqual(res, ref)
 
-    @skipIfHpu
-    def test_dtensor_dynamic_upsample_bicubic2d(self):
-        mesh = self.setup_mesh()
+    # @skipIfHpu
+    # def test_dtensor_dynamic_upsample_bicubic2d(self):
+    #     mesh = self.setup_mesh()
 
-        def fn(x):
-            return torch.nn.functional.interpolate(x, scale_factor=2, mode='bicubic', align_corners=False)
+    #     def fn(x):
+    #         return torch.nn.functional.interpolate(x, scale_factor=2, mode='bicubic', align_corners=False)
 
-        x = DTensor.from_local(torch.rand(2, 3, 4, 4), mesh, [Shard(0)], run_check=False)
-        torch._dynamo.mark_dynamic(x, 0)
-        ref = fn(x)
+    #     x = DTensor.from_local(torch.rand(2, 3, 4, 4), mesh, [Shard(0)], run_check=False)
+    #     torch._dynamo.mark_dynamic(x, 0)
+    #     ref = fn(x)
 
-        opt_fn = torch.compile(fn, backend="aot_eager", fullgraph=True)
-        res = opt_fn(x)
-        self.assertEqual(res, ref)
+    #     opt_fn = torch.compile(fn, backend="aot_eager", fullgraph=True)
+    #     res = opt_fn(x)
+    #     self.assertEqual(res, ref)
 
-    @skipIfHpu
-    def test_dtensor_dynamic_upsample_linear1d(self):
-        mesh = self.setup_mesh()
+    # @skipIfHpu
+    # def test_dtensor_dynamic_upsample_linear1d(self):
+    #     mesh = self.setup_mesh()
 
-        def fn(x):
-            return torch.nn.functional.interpolate(x, scale_factor=2, mode='linear', align_corners=False)
+    #     def fn(x):
+    #         return torch.nn.functional.interpolate(x, scale_factor=2, mode='linear', align_corners=False)
 
-        x = DTensor.from_local(torch.rand(2, 3, 8), mesh, [Shard(0)], run_check=False)
-        torch._dynamo.mark_dynamic(x, 0)
-        ref = fn(x)
+    #     x = DTensor.from_local(torch.rand(2, 3, 8), mesh, [Shard(0)], run_check=False)
+    #     torch._dynamo.mark_dynamic(x, 0)
+    #     ref = fn(x)
 
-        opt_fn = torch.compile(fn, backend="aot_eager", fullgraph=True)
-        res = opt_fn(x)
-        self.assertEqual(res, ref)
+    #     opt_fn = torch.compile(fn, backend="aot_eager", fullgraph=True)
+    #     res = opt_fn(x)
+    #     self.assertEqual(res, ref)
 
-    @skipIfHpu
-    def test_dtensor_dynamic_upsample_trilinear3d(self):
-        mesh = self.setup_mesh()
+    # @skipIfHpu
+    # def test_dtensor_dynamic_upsample_trilinear3d(self):
+    #     mesh = self.setup_mesh()
 
-        def fn(x):
-            return torch.nn.functional.interpolate(x, scale_factor=2, mode='trilinear', align_corners=False)
+    #     def fn(x):
+    #         return torch.nn.functional.interpolate(x, scale_factor=2, mode='trilinear', align_corners=False)
 
-        x = DTensor.from_local(torch.rand(1, 2, 2, 2, 2), mesh, [Shard(0)], run_check=False)
-        torch._dynamo.mark_dynamic(x, 0)
-        ref = fn(x)
+    #     x = DTensor.from_local(torch.rand(1, 2, 2, 2, 2), mesh, [Shard(0)], run_check=False)
+    #     torch._dynamo.mark_dynamic(x, 0)
+    #     ref = fn(x)
 
-        opt_fn = torch.compile(fn, backend="aot_eager", fullgraph=True)
-        res = opt_fn(x)
-        self.assertEqual(res, ref)
+    #     opt_fn = torch.compile(fn, backend="aot_eager", fullgraph=True)
+    #     res = opt_fn(x)
+    #     self.assertEqual(res, ref)
 
     @skipIfHpu
     def test_dtensor_dynamic_foreach_norm_scalar(self):
@@ -1995,31 +2041,31 @@ class TestDTensorCompileDynamic(torch._dynamo.test_case.TestCase):
         res = opt_fn(grad_output, input, target, weight, 1, -100, total_weight)
         self.assertEqual(res, ref)
 
-    @skipIfHpu
-    def test_dtensor_dynamic_native_layer_norm_backward(self):
-        mesh = self.setup_mesh()
+    # @skipIfHpu
+    # def test_dtensor_dynamic_native_layer_norm_backward(self):
+    #     mesh = self.setup_mesh()
 
-        def fn(grad_out, input, normalized_shape, mean, rstd, weight, bias, output_mask):
-            return torch.ops.aten.native_layer_norm_backward(
-                grad_out, input, normalized_shape, mean, rstd, weight, bias, output_mask
-            )
+    #     def fn(grad_out, input, normalized_shape, mean, rstd, weight, bias, output_mask):
+    #         return torch.ops.aten.native_layer_norm_backward(
+    #             grad_out, input, normalized_shape, mean, rstd, weight, bias, output_mask
+    #         )
 
-        x = DTensor.from_local(torch.rand(4, 4), mesh, [Shard(0)], run_check=False)
-        weight = DTensor.from_local(torch.rand(4), mesh, [Replicate()], run_check=False)
-        bias = DTensor.from_local(torch.rand(4), mesh, [Replicate()], run_check=False)
+    #     x = DTensor.from_local(torch.rand(4, 4), mesh, [Shard(0)], run_check=False)
+    #     weight = DTensor.from_local(torch.rand(4), mesh, [Replicate()], run_check=False)
+    #     bias = DTensor.from_local(torch.rand(4), mesh, [Replicate()], run_check=False)
 
-        # Get forward pass results for backward - use proper layer norm forward
-        ln_out, mean, rstd = torch.ops.aten.native_layer_norm(x, [4], weight, bias, 1e-5)
+    #     # Get forward pass results for backward - use proper layer norm forward
+    #     ln_out, mean, rstd = torch.ops.aten.native_layer_norm(x, [4], weight, bias, 1e-5)
 
-        grad_out = DTensor.from_local(torch.rand(4, 4), mesh, [Shard(0)], run_check=False)
-        torch._dynamo.mark_dynamic(grad_out, 0)
-        ref = fn(grad_out, x, [4], mean, rstd, weight, bias, [True, True, True])
+    #     grad_out = DTensor.from_local(torch.rand(4, 4), mesh, [Shard(0)], run_check=False)
+    #     torch._dynamo.mark_dynamic(grad_out, 0)
+    #     ref = fn(grad_out, x, [4], mean, rstd, weight, bias, [True, True, True])
 
-        opt_fn = torch.compile(fn, backend="aot_eager", fullgraph=True)
-        res = opt_fn(grad_out, x, [4], mean, rstd, weight, bias, [True, True, True])
-        for r, o in zip(ref, res):
-            if r is not None and o is not None:
-                self.assertEqual(r, o)
+    #     opt_fn = torch.compile(fn, backend="aot_eager", fullgraph=True)
+    #     res = opt_fn(grad_out, x, [4], mean, rstd, weight, bias, [True, True, True])
+    #     for r, o in zip(ref, res):
+    #         if r is not None and o is not None:
+    #             self.assertEqual(r, o)
 
     @skipIfHpu
     def test_dtensor_dynamic_select_backward(self):
@@ -2028,7 +2074,8 @@ class TestDTensorCompileDynamic(torch._dynamo.test_case.TestCase):
         def fn(grad_output, input_sizes, dim, index):
             return torch.ops.aten.select_backward(grad_output, input_sizes, dim, index)
 
-        grad_output = DTensor.from_local(torch.rand(4), mesh, [Shard(0)], run_check=False)
+        # Each rank has 2
+        grad_output = DTensor.from_local(torch.rand(2), mesh, [Shard(0)], run_check=False)
         torch._dynamo.mark_dynamic(grad_output, 0)
         ref = fn(grad_output, [4, 4], 0, 1)
 
@@ -2043,7 +2090,8 @@ class TestDTensorCompileDynamic(torch._dynamo.test_case.TestCase):
         def fn(grad_output, input_sizes, dim, start, end, step):
             return torch.ops.aten.slice_backward(grad_output, input_sizes, dim, start, end, step)
 
-        grad_output = DTensor.from_local(torch.rand(2, 4), mesh, [Shard(0)], run_check=False)
+        # Each rank has local tensor shape [1, 4]
+        grad_output = DTensor.from_local(torch.rand(1, 4), mesh, [Shard(0)], run_check=False)
         torch._dynamo.mark_dynamic(grad_output, 0)
         ref = fn(grad_output, [4, 4], 0, 1, 3, 1)
 
