@@ -42,10 +42,16 @@ from torch.testing._internal.common_utils import (
     TEST_CUDA,
     TEST_HPU,
     TEST_WITH_ROCM,
+    TEST_WITH_TORCHINDUCTOR,
     TEST_WITH_TSAN,
     TEST_XPU,
-    TestCase,
+    # TestCase,
 )
+if TEST_WITH_TORCHINDUCTOR:
+    from torch._inductor.test_case import TestCase
+else:
+    from torch.testing._internal.common_utils import TestCase  # type: ignore[assignment]
+
 from torch.testing._internal.distributed.multi_threaded_pg import (
     _install_threaded_pg,
     _uninstall_threaded_pg,
