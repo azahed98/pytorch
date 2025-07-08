@@ -299,6 +299,8 @@ def forward(self, b_parametrizations_buffer_original0, x):
             print("AVG ADD TIME COMPILE:", f"{avg_time_compile:.5e}")
             if total_time_eager > 0:
                 print("AVG ADD TIME DIFF:", f"{avg_time_eager- avg_time_compile:.5e}")
+        print("TOTAL COUNT EAGER", f"{total_count_eager}")
+        print("TOTAL COUNT COMPILE", f"{total_count_compile}")
 
         total_time_base = torch.distributed.tensor._op_schema.TOTAL_TIME_BASE
         total_time_recur = torch.distributed.tensor._op_schema.TOTAL_TIME_RECUR
@@ -309,6 +311,7 @@ def forward(self, b_parametrizations_buffer_original0, x):
 
         print("AVG BASE HASSYM TIME", f"{avg_time_base:.5e}")
         print("AVG RECUR HASSYM TIME", f"{avg_time_recur:.5e}")
+        print("TOTAL COUNT HASSYM", f"{total_count_hassym}")
 
     @skipIfHpu
     def test_dtensor_dynamic_cat(self):
@@ -325,18 +328,31 @@ def forward(self, b_parametrizations_buffer_original0, x):
         mesh = DeviceMesh(self.device_type, torch.arange(self.world_size))
         for i in range(1000):
             # test passing in DTensor as inputs/outputs and run some tensor computation
-            def fn(x,y):
-                tensors = torch.cat((x,y), dim=0)
+            # def fn(x,y):
+            #     tensors = torch.cat((x,y), dim=0)
+            #     # breakpoint()
+            #     return tensors
+
+            # x = DTensor.from_local(torch.rand(4, 4), mesh, [Shard(0)], run_check=False)
+            # y = DTensor.from_local(torch.rand(4, 4), mesh, [Shard(0)], run_check=False)
+            # torch._dynamo.mark_dynamic(x, 0)
+            # ref = fn(x, y)
+
+            # opt_fn = torch.compile(fn, backend="aot_eager", fullgraph=True)
+            # res = opt_fn(x, y)
+            # self.assertEqual(res, ref)
+            def fn(x):
+                tensors = torch.cat(x, dim=0)
                 # breakpoint()
                 return tensors
 
-            x = DTensor.from_local(torch.rand(4, 4), mesh, [Shard(0)], run_check=False)
-            y = DTensor.from_local(torch.rand(4, 4), mesh, [Shard(0)], run_check=False)
-            torch._dynamo.mark_dynamic(x, 0)
-            ref = fn(x, y)
+            xs = [DTensor.from_local(torch.rand(4, 4), mesh, [Shard(0)], run_check=False) for _ in range(100)]
+            for x in xs:
+                torch._dynamo.mark_dynamic(x, 0)
+            ref = fn(xs)
 
             opt_fn = torch.compile(fn, backend="aot_eager", fullgraph=True)
-            res = opt_fn(x, y)
+            res = opt_fn(xs)
             self.assertEqual(res, ref)
 
         total_time_eager = torch.distributed.tensor._sharding_prop.TOTAL_TIME_EAGER
@@ -353,6 +369,9 @@ def forward(self, b_parametrizations_buffer_original0, x):
             print("AVG CAT TIME COMPILE:", f"{avg_time_compile:.5e}")
             if total_time_eager > 0:
                 print("AVG CAT TIME DIFF:", f"{avg_time_eager - avg_time_compile:.5e}")
+        print("TOTAL COUNT EAGER", f"{total_count_eager}")
+        print("TOTAL COUNT COMPILE", f"{total_count_compile}")
+
 
         total_time_base = torch.distributed.tensor._op_schema.TOTAL_TIME_BASE
         total_time_recur = torch.distributed.tensor._op_schema.TOTAL_TIME_RECUR
@@ -363,6 +382,7 @@ def forward(self, b_parametrizations_buffer_original0, x):
 
         print("AVG BASE HASSYM TIME", f"{avg_time_base:.5e}")
         print("AVG RECUR HASSYM TIME", f"{avg_time_recur:.5e}")
+        print("TOTAL COUNT HASSYM", f"{total_count_hassym}")
 
     def test_dtensor_attribute_access_on_intermediate(self):
         mesh = DeviceMesh(self.device_type, torch.arange(self.world_size))

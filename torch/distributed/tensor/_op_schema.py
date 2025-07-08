@@ -327,7 +327,7 @@ class OpSchema:
         self.has_symints_recursive()
         end_time = time.perf_counter()
 
-        TOTAL_TIME_BASE += end_time - start_time
+        TOTAL_TIME_RECUR += end_time - start_time
 
         TOTAL_COUNT_HASSYM += 1
 
