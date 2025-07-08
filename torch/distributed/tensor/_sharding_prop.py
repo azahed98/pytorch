@@ -1,7 +1,8 @@
 # mypy: allow-untyped-defs
 import threading
+import time
 from collections.abc import Sequence
-from functools import lru_cache
+from functools import lru_cache, _make_key
 from itertools import chain
 from typing import Callable, cast, Optional, Union
 
@@ -25,9 +26,15 @@ from torch.distributed.tensor._utils import (
     compute_local_shape_and_global_offset,
     compute_local_stride,
 )
-
+from collections.abc import Hashable
 
 aten = torch.ops.aten
+
+
+TOTAL_TIME_EAGER = 0
+TOTAL_TIME_COMPILE = 0
+TOTAL_COUNT_EAGER = 0
+TOTAL_COUNT_COMPILE = 0
 
 
 def _length(obj) -> int:
@@ -37,13 +44,62 @@ def _length(obj) -> int:
         return 1
     return len(obj)
 
+def check_hashable(obj):
+    """
+    Checks if an object is hashable, including recursively for common container types.
+    This is not exhaustive for all possible nested unhashable structures
+    (e.g., custom objects with unhashable attributes), but covers common cases.
+    """
+    if isinstance(obj, (list, dict, set)): # Quickly identify common unhashable containers
+        return False
+    elif isinstance(obj, tuple):
+        # Recursively check tuple elements
+        for item in obj:
+            if not check_hashable(item):
+                return False
+        return True
+    elif isinstance(obj, frozenset):
+        # Recursively check frozenset elements
+        for item in obj:
+            if not check_hashable(item):
+                return False
+        return True
+    else:
+        # For other types, the only reliable way is to try hashing since
+        # Hashable only checks top-level
+        try:
+            hash(obj)
+            return True
+        except TypeError:
+            return False
 
 class LocalLRUCache(threading.local):
     def __init__(self, user_function: Callable) -> None:
+        self.end_time = 0
+        self.user_function = user_function
         self.cache = lru_cache(None)(user_function)
 
     def __call__(self, *args, **kwargs) -> object:
-        return self.cache(*args, **kwargs)
+        # OPTIONS 1 and 2:
+        # result = self.cache(*args, **kwargs)
+
+        # OPTION 3:
+        # try:
+        #     result = self.cache(*args, **kwargs)
+        # except TypeError:
+        #     # If the user function is not hashable, we can't use the LRU cache
+        #     # so we fall back to the original function
+        #     result = self.user_function(*args, **kwargs)
+
+        # OPTION 4:
+        hashable = check_hashable(args) and check_hashable(tuple(kwargs.items()))
+        if hashable:
+            result = self.cache(*args, **kwargs)
+        else:
+            result = self.user_function(*args, **kwargs)
+
+        self.end_time = time.perf_counter()
+        return result
 
     def cache_info(self):
         return self.cache.cache_info()
@@ -81,6 +137,9 @@ class ShardingPropagator:
             aten.select_backward.default: 1,
             aten.slice_backward.default: 1,
         }
+
+        self.start_time = 0
+        self.end_time = 0
 
     def register_sharding_prop_rule(
         self,
@@ -256,22 +315,64 @@ class ShardingPropagator:
         )
 
     def propagate(self, op_info: OpInfo) -> None:
+        global TOTAL_TIME_EAGER, TOTAL_COUNT_EAGER, TOTAL_TIME_COMPILE, TOTAL_COUNT_COMPILE
+        self.start_time = time.perf_counter()
+        # START TIME
+
         # We cannot use an lru cache if we know that inputs will have dynamic shapes,
         # because SymInts are not hashable.
         # This is generally ok because this only happens during tracing in torch.compile,
         # and tracing does not need to be as fast as eagermode DTensor usages.
+
+        # OPTION 1: Check has_symint to decide whether to use cache or not
+        # if op_info.schema.has_symints:
+        #     output_sharding = self.propagate_op_sharding_non_cached(op_info.schema)
+        # else:
+        #     output_sharding = cast(
+        #         OutputSharding, self.propagate_op_sharding(op_info.schema)
+        #     )
+
+        # OPTION 2: Check _are_we_tracing() to decide whether to use cache or not
         if _are_we_tracing():
             output_sharding = self.propagate_op_sharding_non_cached(op_info.schema)
         else:
             output_sharding = cast(
                 OutputSharding, self.propagate_op_sharding(op_info.schema)
             )
+       
+        # OPTION 3 + 4: use a local cache with fallback
+        # output_sharding = cast(
+        #     OutputSharding, self.propagate_op_sharding(op_info.schema)
+        # )
+
+        # END TIME SHOULD BE FROM PROPAGATE_OP_SHARDING
+        end_time = self.end_time
+        if end_time == 0:
+            end_time = self.propagate_op_sharding.end_time
+            print("end_time from propagate_op_sharding")
+            assert end_time != 0
+        elapsed_time = end_time - self.start_time
+        if _are_we_tracing():
+            TOTAL_TIME_COMPILE += elapsed_time
+            TOTAL_COUNT_COMPILE += 1
+        else:
+            TOTAL_TIME_EAGER += elapsed_time
+            TOTAL_COUNT_EAGER += 1
+
         op_info.output_sharding = output_sharding
 
+        # RESET
+        self.start_time = 0
+        self.end_time = 0
+        self.propagate_op_sharding.cache.cache_clear()
+
+    
     def propagate_op_sharding_non_cached(self, op_schema: OpSchema) -> OutputSharding:
         """
         Propagate the sharding for an operator given the op_schema.
         """
+        self.end_time = time.perf_counter()
+
         # special case op, we don't need to propagate for local
         # scalar. TODO: figure out a better way to handle this
         if op_schema.op is aten._local_scalar_dense.default:
@@ -495,9 +596,9 @@ class ShardingPropagator:
 
         op_spec_costs: list[float] = []
         for op_spec in strategy.strategies:
-            assert op_spec.redistribute_cost is not None, (
-                "must set redistribute cost each OpSpec!"
-            )
+            assert (
+                op_spec.redistribute_cost is not None
+            ), "must set redistribute cost each OpSpec!"
             redistribute_cost = sum(chain.from_iterable(op_spec.redistribute_cost))
             op_spec_costs.append(redistribute_cost)
 

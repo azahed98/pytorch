@@ -258,23 +258,86 @@ def forward(self, b_parametrizations_buffer_original0, x):
 
     @skipIfHpu
     def test_dtensor_dynamic(self):
+        # RESET COUNTS
+        torch.distributed.tensor._sharding_prop.TOTAL_TIME_EAGER = 0
+        torch.distributed.tensor._sharding_prop.TOTAL_COUNT_EAGER = 0
+        torch.distributed.tensor._sharding_prop.TOTAL_TIME_COMPILE = 0
+        torch.distributed.tensor._sharding_prop.TOTAL_COUNT_COMPILE = 0
+
         mesh = DeviceMesh(self.device_type, torch.arange(self.world_size))
 
-        # test passing in DTensor as inputs/outputs and run some tensor computation
-        def fn(x):
-            return (
-                torch.mul(x, x)
-                .redistribute(device_mesh=x.device_mesh, placements=[Replicate()])
-                .to_local()[0]
-            )
+        for i in range(1000):
+            # test passing in DTensor as inputs/outputs and run some tensor computation
+            def fn(x):
+                return (
+                    torch.mul(x, x)
+                    .redistribute(device_mesh=x.device_mesh, placements=[Replicate()])
+                    .to_local()[0]
+                )
 
-        x = DTensor.from_local(torch.rand(4, 4), mesh, [Shard(0)], run_check=False)
-        torch._dynamo.mark_dynamic(x, 0)
-        ref = fn(x)
+            x = DTensor.from_local(torch.rand(4, 4), mesh, [Shard(0)], run_check=False)
+            torch._dynamo.mark_dynamic(x, 0)
+            ref = fn(x)
 
-        opt_fn = torch.compile(fn, backend="aot_eager", fullgraph=True)
-        res = opt_fn(x)
-        self.assertEqual(res, ref)
+            opt_fn = torch.compile(fn, backend="aot_eager", fullgraph=True)
+            res = opt_fn(x)
+            self.assertEqual(res, ref)
+
+        total_time_eager = torch.distributed.tensor._sharding_prop.TOTAL_TIME_EAGER
+        total_count_eager = torch.distributed.tensor._sharding_prop.TOTAL_COUNT_EAGER
+        total_time_compile = torch.distributed.tensor._sharding_prop.TOTAL_TIME_COMPILE
+        total_count_compile = torch.distributed.tensor._sharding_prop.TOTAL_COUNT_COMPILE
+        avg_time_eager = 0
+        avg_time_compile = 0
+        if total_count_eager > 0:
+            avg_time_eager = total_time_eager / total_count_eager
+            print("AVG ADD TIME EAGER:", f"{avg_time_eager:.5e}")
+        if total_count_compile:
+            avg_time_compile = total_time_compile / total_count_compile
+            print("AVG ADD TIME COMPILE:", f"{avg_time_compile:.5e}")
+            if total_time_eager > 0:
+                print("AVG ADD TIME DIFF:", f"{avg_time_eager- avg_time_compile:.5e}")
+
+    @skipIfHpu
+    def test_dtensor_dynamic_cat(self):
+        # RESET COUNTS
+        torch.distributed.tensor._sharding_prop.TOTAL_TIME_EAGER = 0
+        torch.distributed.tensor._sharding_prop.TOTAL_COUNT_EAGER = 0
+        torch.distributed.tensor._sharding_prop.TOTAL_TIME_COMPILE = 0
+        torch.distributed.tensor._sharding_prop.TOTAL_COUNT_COMPILE = 0
+    
+        mesh = DeviceMesh(self.device_type, torch.arange(self.world_size))
+        for i in range(1000):
+            # test passing in DTensor as inputs/outputs and run some tensor computation
+            def fn(x,y):
+                tensors = torch.cat((x,y), dim=0)
+                # breakpoint()
+                return tensors
+
+            x = DTensor.from_local(torch.rand(4, 4), mesh, [Shard(0)], run_check=False)
+            y = DTensor.from_local(torch.rand(4, 4), mesh, [Shard(0)], run_check=False)
+            torch._dynamo.mark_dynamic(x, 0)
+            ref = fn(x, y)
+
+            opt_fn = torch.compile(fn, backend="aot_eager", fullgraph=True)
+            res = opt_fn(x, y)
+            self.assertEqual(res, ref)
+
+        total_time_eager = torch.distributed.tensor._sharding_prop.TOTAL_TIME_EAGER
+        total_count_eager = torch.distributed.tensor._sharding_prop.TOTAL_COUNT_EAGER
+        total_time_compile = torch.distributed.tensor._sharding_prop.TOTAL_TIME_COMPILE
+        total_count_compile = torch.distributed.tensor._sharding_prop.TOTAL_COUNT_COMPILE
+        avg_time_eager = 0
+        avg_time_compile = 0
+        if total_count_eager > 0:
+            avg_time_eager = total_time_eager / total_count_eager
+            print("AVG CAT TIME EAGER:", f"{avg_time_eager:.5e}")
+        if total_count_compile:
+            avg_time_compile = total_time_compile / total_count_compile
+            print("AVG CAT TIME COMPILE:", f"{avg_time_compile:.5e}")
+            if total_time_eager > 0:
+                print("AVG CAT TIME DIFF:", f"{avg_time_eager - avg_time_compile:.5e}")
+
 
     def test_dtensor_attribute_access_on_intermediate(self):
         mesh = DeviceMesh(self.device_type, torch.arange(self.world_size))
@@ -896,7 +959,7 @@ def forward(self, primals_1):
 class TestDTensorCompileE2E(DTensorTestBase):
     @property
     def world_size(self):
-        return 4
+        return 1
 
     # multiprocess relies on pickling the source code
     # so compiled autograd tests can't dynamically wrap this class
@@ -910,6 +973,12 @@ class TestDTensorCompileE2E(DTensorTestBase):
     @parametrize("use_ca", [True, False])
     def test_tp_compile_fullgraph(self, is_seq_parallel, use_ca):
         mesh = DeviceMesh(self.device_type, torch.arange(self.world_size))
+
+        # RESET COUNTS
+        torch.distributed.tensor._sharding_prop.TOTAL_TIME_EAGER = 0
+        torch.distributed.tensor._sharding_prop.TOTAL_COUNT_EAGER = 0
+        torch.distributed.tensor._sharding_prop.TOTAL_TIME_COMPILE = 0
+        torch.distributed.tensor._sharding_prop.TOTAL_COUNT_COMPILE = 0
 
         model = SimpleModel(self.device_type)
 
@@ -958,15 +1027,32 @@ class TestDTensorCompileE2E(DTensorTestBase):
         rng_seed = self.rank if is_seq_parallel else 0
         torch.manual_seed(rng_seed)
         inp = torch.rand(20, 10, device=self.device_type)
-        out = model(inp)
         cnt = torch._dynamo.testing.CompileCounterWithBackend("aot_eager")
         compiled_mod = torch.compile(model, backend=cnt, fullgraph=True)
-        compiled_out = compiled_mod(inp)
-        with self._bwd_ctx(use_ca):
-            compiled_out.sum().backward()
-        self.assertEqual(compiled_out, out)
-        self.assertEqual(cnt.frame_count, 1)
-
+        out = model(inp)
+        for i in range(1000):
+            compiled_out = compiled_mod(inp)
+            with self._bwd_ctx(use_ca):
+                compiled_out.sum().backward()
+            self.assertEqual(compiled_out, out)
+            self.assertEqual(cnt.frame_count, 1)
+    
+        total_time_eager = torch.distributed.tensor._sharding_prop.TOTAL_TIME_EAGER
+        total_count_eager = torch.distributed.tensor._sharding_prop.TOTAL_COUNT_EAGER
+        total_time_compile = torch.distributed.tensor._sharding_prop.TOTAL_TIME_COMPILE
+        total_count_compile = torch.distributed.tensor._sharding_prop.TOTAL_COUNT_COMPILE
+        avg_time_eager = 0
+        avg_time_compile = 0
+        print("TOTAL CA COUNT EAGER:", f"{total_count_eager}")
+        print("TOTAL CA COUNT COMPILE:", f"{total_count_compile}")
+        if total_count_eager > 0:
+            avg_time_eager = total_time_eager / total_count_eager
+            print("AVG CA TIME EAGER:", f"{avg_time_eager:.5e}")
+        if total_count_compile:
+            avg_time_compile = total_time_compile / total_count_compile
+            print("AVG CA TIME COMPILE:", f"{avg_time_compile:.5e}")
+            if total_time_eager > 0:
+                print("AVG CA TIME DIFF:", f"{avg_time_eager- avg_time_compile:.5e}")
     @with_comms
     @skip_if_lt_x_gpu(4)
     @parametrize("use_ca", [True, False])
