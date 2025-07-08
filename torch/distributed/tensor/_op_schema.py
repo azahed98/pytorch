@@ -4,12 +4,13 @@ from dataclasses import dataclass
 from functools import cached_property
 from typing import Any, Optional, Union
 
+import time
 import torch
 from torch._ops import OpOverload
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor._dtensor_spec import DTensorSpec
 from torch.distributed.tensor.placement_types import Placement
-
+from torch.types import py_sym_types
 
 try:
     from torch.utils._cxx_pytree import tree_leaves, tree_map_only, TreeSpec
@@ -31,6 +32,9 @@ PlacementList = list[Optional[Placement]]
 # be the same set of possibilities.
 OutputSpecType = Optional[Union[DTensorSpec, Sequence[Optional[DTensorSpec]]]]
 
+TOTAL_TIME_BASE = 0
+TOTAL_TIME_RECUR = 0
+TOTAL_COUNT_HASSYM = 0
 
 def _rebuild_tensor_from_dtensor_meta(arg) -> object:
     """
@@ -299,24 +303,33 @@ class OpSchema:
                     break
         self.has_symints = has_symints
     
-    def has_symints_recursive(self, a: Any):
-        if isinstance(a, DTensorSpec) and a.tensor_meta is not None:
-            if any(isinstance(s, torch.SymInt) for s in a.tensor_meta.shape):
-                return True
-        elif isinstance(a, (list, tuple)):
-            for e in a:
-                if self.has_symints_recursive(e):
-                    return True
-        return False
-
-    def __post_init__(self) -> None:
+    def has_symints_recursive(self):
         has_symints = False
-        for a in self.args_schema:
+        for a in tree_leaves(self.args_schema):
             if isinstance(a, DTensorSpec) and a.tensor_meta is not None:
                 if any(isinstance(s, torch.SymInt) for s in a.tensor_meta.shape):
                     has_symints = True
                     break
+            elif isinstance(a, py_sym_types):
+                has_symints = True
+                break
         self.has_symints = has_symints
+
+    def __post_init__(self) -> None:
+        global TOTAL_COUNT_HASSYM, TOTAL_TIME_BASE, TOTAL_TIME_RECUR
+        start_time = time.perf_counter()
+        self.has_symints_toplevel()
+        end_time = time.perf_counter()
+
+        TOTAL_TIME_BASE += end_time - start_time
+
+        start_time = time.perf_counter()
+        self.has_symints_recursive()
+        end_time = time.perf_counter()
+
+        TOTAL_TIME_BASE += end_time - start_time
+
+        TOTAL_COUNT_HASSYM += 1
 
     def arg_type_tensor_or_tensor_list_like(self, arg_idx: int) -> bool:
         arg = self.args_schema[arg_idx]

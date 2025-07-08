@@ -263,7 +263,9 @@ def forward(self, b_parametrizations_buffer_original0, x):
         torch.distributed.tensor._sharding_prop.TOTAL_COUNT_EAGER = 0
         torch.distributed.tensor._sharding_prop.TOTAL_TIME_COMPILE = 0
         torch.distributed.tensor._sharding_prop.TOTAL_COUNT_COMPILE = 0
-
+        torch.distributed.tensor._op_schema.TOTAL_TIME_BASE = 0
+        torch.distributed.tensor._op_schema.TOTAL_TIME_RECUR = 0
+        torch.distributed.tensor._op_schema.TOTAL_COUNT_HASSYM = 0
         mesh = DeviceMesh(self.device_type, torch.arange(self.world_size))
 
         for i in range(1000):
@@ -298,6 +300,16 @@ def forward(self, b_parametrizations_buffer_original0, x):
             if total_time_eager > 0:
                 print("AVG ADD TIME DIFF:", f"{avg_time_eager- avg_time_compile:.5e}")
 
+        total_time_base = torch.distributed.tensor._op_schema.TOTAL_TIME_BASE
+        total_time_recur = torch.distributed.tensor._op_schema.TOTAL_TIME_RECUR
+        total_count_hassym = torch.distributed.tensor._op_schema.TOTAL_COUNT_HASSYM
+
+        avg_time_base = total_time_base/total_count_hassym
+        avg_time_recur = total_time_recur/total_count_hassym
+
+        print("AVG BASE HASSYM TIME", f"{avg_time_base:.5e}")
+        print("AVG RECUR HASSYM TIME", f"{avg_time_recur:.5e}")
+
     @skipIfHpu
     def test_dtensor_dynamic_cat(self):
         # RESET COUNTS
@@ -305,7 +317,11 @@ def forward(self, b_parametrizations_buffer_original0, x):
         torch.distributed.tensor._sharding_prop.TOTAL_COUNT_EAGER = 0
         torch.distributed.tensor._sharding_prop.TOTAL_TIME_COMPILE = 0
         torch.distributed.tensor._sharding_prop.TOTAL_COUNT_COMPILE = 0
-    
+
+        torch.distributed.tensor._op_schema.TOTAL_TIME_BASE = 0
+        torch.distributed.tensor._op_schema.TOTAL_TIME_RECUR = 0
+        torch.distributed.tensor._op_schema.TOTAL_COUNT_HASSYM = 0
+
         mesh = DeviceMesh(self.device_type, torch.arange(self.world_size))
         for i in range(1000):
             # test passing in DTensor as inputs/outputs and run some tensor computation
@@ -338,6 +354,15 @@ def forward(self, b_parametrizations_buffer_original0, x):
             if total_time_eager > 0:
                 print("AVG CAT TIME DIFF:", f"{avg_time_eager - avg_time_compile:.5e}")
 
+        total_time_base = torch.distributed.tensor._op_schema.TOTAL_TIME_BASE
+        total_time_recur = torch.distributed.tensor._op_schema.TOTAL_TIME_RECUR
+        total_count_hassym = torch.distributed.tensor._op_schema.TOTAL_COUNT_HASSYM
+
+        avg_time_base = total_time_base/total_count_hassym
+        avg_time_recur = total_time_recur/total_count_hassym
+
+        print("AVG BASE HASSYM TIME", f"{avg_time_base:.5e}")
+        print("AVG RECUR HASSYM TIME", f"{avg_time_recur:.5e}")
 
     def test_dtensor_attribute_access_on_intermediate(self):
         mesh = DeviceMesh(self.device_type, torch.arange(self.world_size))
