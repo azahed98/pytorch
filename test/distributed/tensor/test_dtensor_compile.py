@@ -317,6 +317,21 @@ def forward(self, b_parametrizations_buffer_original0, x):
             res = opt_fn(x)
         self.assertEqual(res, ref)
 
+    def test_dtensor_dynamic_higher_rank(self):
+        mesh = DeviceMesh(self.device_type, torch.arange(self.world_size))
+
+        x = DTensor.from_local(torch.ones([5, 10, 2], requires_grad=True), mesh, [Replicate()], run_check=False)
+        y = DTensor.from_local(torch.ones([5, 10, 2], requires_grad=True), mesh, [Replicate()], run_check=False)
+        # x = torch.ones([5, 10, 2], requires_grad=True)
+        # y = torch.ones([5, 10, 2], requires_grad=True)
+
+
+        ref = torch.add(x, y)
+        
+        jitted_fn = torch.compile(torch.add, dynamic=True, fullgraph=True)
+        result = jitted_fn(x, y)
+        self.assertEqual(result, ref)
+
     def test_dtensor_attribute_access_on_intermediate(self):
         mesh = DeviceMesh(self.device_type, torch.arange(self.world_size))
 

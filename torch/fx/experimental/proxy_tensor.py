@@ -405,6 +405,7 @@ def get_proxy_slot(
             value = tracer.sympy_expr_tracker[obj.node.expr]
         else:
             if isinstance(default, _NoDefault):
+                # torch.distributed.breakpoint()
                 raise RuntimeError(
                     f"{obj} ({id(obj)})is not tracked with proxy for {tracer}"
                 )
@@ -2292,6 +2293,7 @@ class _MakefxTracer:
             stack.enter_context(_set_make_fx_tracer(self))
 
             assert self.fx_tracer is not None
+            # torch.distributed.breakpoint()
             try:
                 t = dispatch_trace(
                     wrap_key(func, args, self.fx_tracer, self.pre_dispatch),

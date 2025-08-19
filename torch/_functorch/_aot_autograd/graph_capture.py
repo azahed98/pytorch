@@ -374,7 +374,7 @@ def aot_dispatch_autograd_graph(
         fn_prepared_for_autograd, flat_args_descs, aot_config=aot_config
     )
     joint_fn_handle = joint_fn_to_trace.handle
-
+    
     joint_fn_to_trace, updated_joint_inputs, updated_joint_inputs_descs = (
         create_functionalized_fn(
             joint_fn_to_trace,
@@ -387,6 +387,7 @@ def aot_dispatch_autograd_graph(
         )
     )
 
+    torch.distributed.breakpoint()
     # TODO: replace with AOTDispatchSubclassWrapper once we refactor
     # fn_input_mutations_to_outputs and create_functionalized_fn
     # into CompilerWrappers.
