@@ -758,6 +758,7 @@ class Tracer(TracerBase):
 
             A ``Graph`` representing the semantics of the passed-in ``root``.
         """
+        torch.distributed.breakpoint()
         global _is_fx_tracing_flag
         old_is_fx_tracing_flag = _is_fx_tracing_flag
         _is_fx_tracing_flag = True
@@ -862,6 +863,7 @@ class Tracer(TracerBase):
                     _autowrap_check(
                         patcher, module.__dict__, self._autowrap_function_ids
                     )
+                torch.distributed.breakpoint()
                 self.create_node(
                     "output",
                     "output",

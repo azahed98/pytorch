@@ -79,6 +79,7 @@ def _create_graph(
             _allow_token_discovery=True,
         ),
     ):
+        torch.distributed.breakpoint()
         fx_g = make_fx(
             inner_f,
             decomposition_table=aot_config.decompositions,
@@ -387,7 +388,7 @@ def aot_dispatch_autograd_graph(
         )
     )
 
-    torch.distributed.breakpoint()
+    # torch.distributed.breakpoint()
     # TODO: replace with AOTDispatchSubclassWrapper once we refactor
     # fn_input_mutations_to_outputs and create_functionalized_fn
     # into CompilerWrappers.

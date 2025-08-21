@@ -1167,6 +1167,7 @@ def aot_dispatch_subclass(
     meta: ViewAndMutationMeta,
     fw_only: Callable,
 ) -> SubclassTracingInfo:
+    # torch.distributed.breakpoint()
     # Skip logic if we don't need to trace through any subclasses
     req_subclass_dispatch = requires_subclass_dispatch(args, meta)
     if not req_subclass_dispatch:
