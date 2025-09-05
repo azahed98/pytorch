@@ -717,6 +717,7 @@ class Tracer(TracerBase):
             )
 
             def flatten_fn(*args):
+                torch.distributed.breakpoint()
                 tree_args = pytree.tree_unflatten(list(args), in_spec)
                 tree_out = root_fn(*tree_args)
                 out_args, out_spec = pytree.tree_flatten(tree_out)
@@ -758,7 +759,7 @@ class Tracer(TracerBase):
 
             A ``Graph`` representing the semantics of the passed-in ``root``.
         """
-        torch.distributed.breakpoint()
+        # torch.distributed.breakpoint()
         global _is_fx_tracing_flag
         old_is_fx_tracing_flag = _is_fx_tracing_flag
         _is_fx_tracing_flag = True
@@ -863,7 +864,7 @@ class Tracer(TracerBase):
                     _autowrap_check(
                         patcher, module.__dict__, self._autowrap_function_ids
                     )
-                torch.distributed.breakpoint()
+                # torch.distributed.breakpoint()
                 self.create_node(
                     "output",
                     "output",

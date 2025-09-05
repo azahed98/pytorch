@@ -260,6 +260,7 @@ def set_proxy_slot(  # type: ignore[no-redef]
     tracer: _ProxyTracer,
     proxy: object,
 ) -> None:
+    # torch.distributed.breakpoint()
     log.debug("set_proxy_slot %s (%s) %s", obj, id(obj), proxy)
     if isinstance(obj, Tensor):
         # We DO want to clobber proxies whenever we run an inplace operation
@@ -399,6 +400,7 @@ def get_proxy_slot(
         assert isinstance(obj, py_sym_types), type(obj)
         tracker = tracer.symnode_tracker
 
+    torch.distributed.breakpoint()
     if obj not in tracker:
         # Last ditch
         if isinstance(obj, py_sym_types) and obj.node.expr in tracer.sympy_expr_tracker:
@@ -1344,7 +1346,7 @@ def wrap_key(
     pre_dispatch: bool,
 ) -> Callable[_P, R]:
     flat_tensors, _tensors_spec = pytree.tree_flatten(tensors)
-
+    torch.distributed.breakpoint()
     @functools.wraps(f)
     def wrapped(*proxies: _P.args, **_unused: _P.kwargs) -> R:
         flat_proxies, _proxies_spec = pytree.tree_flatten(proxies)
@@ -1356,6 +1358,7 @@ def wrap_key(
         def get_tensor_proxy_slot(t: Tensor) -> Union[Tensor, Proxy]:
             return get_proxy_slot(t, tracer, t, lambda x: x.proxy)  # type: ignore[attr-defined]
 
+        torch.distributed.breakpoint()
         out = f(*tensors)  # type:ignore[call-arg]
         out = pytree.tree_map_only(Tensor, get_tensor_proxy_slot, out)
         out = pytree.tree_map_only(
@@ -1364,7 +1367,7 @@ def wrap_key(
 
         def get_sym_proxy_slot(t: PySymType) -> Proxy:
             return get_proxy_slot(t, tracer).force()
-
+        
         out = pytree.tree_map_only(py_sym_types, get_sym_proxy_slot, out)
         return out
 
