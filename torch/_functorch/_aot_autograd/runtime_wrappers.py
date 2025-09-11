@@ -2121,119 +2121,119 @@ To fix this, your tensor subclass must implement the dunder method __force_to_sa
                     disable_amp=disable_amp,
                 )
 
-                num_outputs = CompiledFunction.metadata.num_outputs
-                num_outputs_aliased = CompiledFunction.metadata.num_outputs_aliased
-                num_mutated_runtime_inps = (
-                    CompiledFunction.metadata.num_mutated_inp_runtime_indices
-                )
+                # num_outputs = CompiledFunction.metadata.num_outputs
+                # num_outputs_aliased = CompiledFunction.metadata.num_outputs_aliased
+                # num_mutated_runtime_inps = (
+                #     CompiledFunction.metadata.num_mutated_inp_runtime_indices
+                # )
                 num_forward_returns = CompiledFunction.metadata.num_forward_returns
 
                 # Partitioners must put symint arguments at the end separate from tensor arguments
-                tensors_saved_for_backwards = fw_outs[
-                    CompiledFunction.metadata.tensors_saved_for_backwards_slice
-                ]
-                assert all(
-                    isinstance(x, torch.Tensor) for x in tensors_saved_for_backwards
-                )
+                # tensors_saved_for_backwards = fw_outs[
+                #     CompiledFunction.metadata.tensors_saved_for_backwards_slice
+                # ]
+                # assert all(
+                #     isinstance(x, torch.Tensor) for x in tensors_saved_for_backwards
+                # )
 
-                def mark_dynamic_activations(activations: list[torch.Tensor]):
-                    for (
-                        idx,
-                        dims,
-                    ) in CompiledFunction.metadata.dynamic_saved_tensors_idxs.items():
-                        maybe_mark_dynamic_helper(activations[idx], dims)
-                    return activations
+                # def mark_dynamic_activations(activations: list[torch.Tensor]):
+                #     for (
+                #         idx,
+                #         dims,
+                #     ) in CompiledFunction.metadata.dynamic_saved_tensors_idxs.items():
+                #         maybe_mark_dynamic_helper(activations[idx], dims)
+                #     return activations
 
-                # See Note [Detaching saved tensors in AOTAutograd]
-                ctx.save_for_backward(
-                    *mark_dynamic_activations(
-                        [
-                            x.detach() if x._is_view() else x
-                            for x in tensors_saved_for_backwards
-                        ]
-                    )
-                )
-                symint_outs = fw_outs[
-                    CompiledFunction.metadata.symints_saved_for_backwards_slice
-                ]
-                assert all(
-                    isinstance(x, (int, float, torch.SymInt, torch.SymFloat))
-                    for x in symint_outs
-                ), str([type(x) for x in symint_outs])
-                ctx.symints = symint_outs
+                # # See Note [Detaching saved tensors in AOTAutograd]
+                # ctx.save_for_backward(
+                #     *mark_dynamic_activations(
+                #         [
+                #             x.detach() if x._is_view() else x
+                #             for x in tensors_saved_for_backwards
+                #         ]
+                #     )
+                # )
+                # symint_outs = fw_outs[
+                #     CompiledFunction.metadata.symints_saved_for_backwards_slice
+                # ]
+                # assert all(
+                #     isinstance(x, (int, float, torch.SymInt, torch.SymFloat))
+                #     for x in symint_outs
+                # ), str([type(x) for x in symint_outs])
+                # ctx.symints = symint_outs
 
                 raw_returns = fw_outs[0:num_forward_returns]
 
-                # Wrap all autograd.Function.forward() outputs that are aliases
-                # so that autograd.Function doesn't treat them as tensors
-                if num_mutated_runtime_inps > 0:
-                    for i, idx in enumerate(
-                        CompiledFunction.metadata.mutated_inp_runtime_indices
-                    ):
-                        # We could make this faster by only looping over inputs with metadata-only mutations
-                        # (instead of looping over inputs with either data or metadata mutations), but there shouldn't be many.
-                        info = CompiledFunction.metadata.input_info[idx]
-                        if info.mutates_metadata and not info.mutates_data:
-                            raw_return_idx = i
-                            raw_returns[raw_return_idx] = TensorAlias(
-                                raw_returns[raw_return_idx]
-                            )
+                # # Wrap all autograd.Function.forward() outputs that are aliases
+                # # so that autograd.Function doesn't treat them as tensors
+                # if num_mutated_runtime_inps > 0:
+                #     for i, idx in enumerate(
+                #         CompiledFunction.metadata.mutated_inp_runtime_indices
+                #     ):
+                #         # We could make this faster by only looping over inputs with metadata-only mutations
+                #         # (instead of looping over inputs with either data or metadata mutations), but there shouldn't be many.
+                #         info = CompiledFunction.metadata.input_info[idx]
+                #         if info.mutates_metadata and not info.mutates_data:
+                #             raw_return_idx = i
+                #             raw_returns[raw_return_idx] = TensorAlias(
+                #                 raw_returns[raw_return_idx]
+                #             )
 
-                    if config.debug_assert:
-                        user_mutated_inputs_raw = raw_returns[
-                            0:num_mutated_runtime_inps
-                        ]
-                        mut_inp_infos = [
-                            x
-                            for x in CompiledFunction.metadata.input_info
-                            if x.mutates_data or x.mutates_metadata
-                        ]
-                        assert len(user_mutated_inputs_raw) == len(mut_inp_infos)
+                #     if config.debug_assert:
+                #         user_mutated_inputs_raw = raw_returns[
+                #             0:num_mutated_runtime_inps
+                #         ]
+                #         mut_inp_infos = [
+                #             x
+                #             for x in CompiledFunction.metadata.input_info
+                #             if x.mutates_data or x.mutates_metadata
+                #         ]
+                #         assert len(user_mutated_inputs_raw) == len(mut_inp_infos)
 
-                if CompiledFunction.metadata.num_unsafe_view_outputs > 0:
-                    for idx in CompiledFunction.metadata.unsafe_view_out_indices:
-                        raw_return_idx = num_mutated_runtime_inps + idx
-                        o = raw_returns[raw_return_idx]
-                        raw_returns[raw_return_idx] = torch.ops.aten._unsafe_view(
-                            o, o.shape
-                        )
+                # if CompiledFunction.metadata.num_unsafe_view_outputs > 0:
+                #     for idx in CompiledFunction.metadata.unsafe_view_out_indices:
+                #         raw_return_idx = num_mutated_runtime_inps + idx
+                #         o = raw_returns[raw_return_idx]
+                #         raw_returns[raw_return_idx] = torch.ops.aten._unsafe_view(
+                #             o, o.shape
+                #         )
 
-                if num_outputs_aliased > 0:
-                    for idx in CompiledFunction.metadata.aliased_out_indices:
-                        raw_return_idx = num_mutated_runtime_inps + idx
-                        raw_returns[raw_return_idx] = TensorAlias(
-                            raw_returns[raw_return_idx]
-                        )
+                # if num_outputs_aliased > 0:
+                #     for idx in CompiledFunction.metadata.aliased_out_indices:
+                #         raw_return_idx = num_mutated_runtime_inps + idx
+                #         raw_returns[raw_return_idx] = TensorAlias(
+                #             raw_returns[raw_return_idx]
+                #         )
 
-                    if config.debug_assert:
-                        intermediates_raw = raw_returns[
-                            num_mutated_runtime_inps + num_outputs :
-                        ]
-                        assert not any(
-                            isinstance(x, TensorAlias) for x in intermediates_raw
-                        )
+                #     if config.debug_assert:
+                #         intermediates_raw = raw_returns[
+                #             num_mutated_runtime_inps + num_outputs :
+                #         ]
+                #         assert not any(
+                #             isinstance(x, TensorAlias) for x in intermediates_raw
+                #         )
 
-                # invariant: intermediate bases always require gradients, so we don't have to
-                # consider marking them as non-differentiable.
-                raw_returns_not_including_intermediate_bases = raw_returns[
-                    : num_mutated_runtime_inps + num_outputs
-                ]
-                raw_returns_meta = [
-                    x
-                    for x in CompiledFunction.metadata.input_info
-                    if x.mutation_type == MutationType.MUTATED_OUT_GRAPH
-                ] + CompiledFunction.metadata.output_info
+                # # invariant: intermediate bases always require gradients, so we don't have to
+                # # consider marking them as non-differentiable.
+                # raw_returns_not_including_intermediate_bases = raw_returns[
+                #     : num_mutated_runtime_inps + num_outputs
+                # ]
+                # raw_returns_meta = [
+                #     x
+                #     for x in CompiledFunction.metadata.input_info
+                #     if x.mutation_type == MutationType.MUTATED_OUT_GRAPH
+                # ] + CompiledFunction.metadata.output_info
 
-                fw_outs_not_requiring_grad = [
-                    x
-                    for (i, x) in enumerate(
-                        raw_returns_not_including_intermediate_bases
-                    )
-                    if isinstance(x, torch.Tensor)
-                    and not raw_returns_meta[i].requires_grad
-                ]
-                ctx.mark_non_differentiable(*fw_outs_not_requiring_grad)
-                ctx._materialize_non_diff_grads = False
+                # fw_outs_not_requiring_grad = [
+                #     x
+                #     for (i, x) in enumerate(
+                #         raw_returns_not_including_intermediate_bases
+                #     )
+                #     if isinstance(x, torch.Tensor)
+                #     and not raw_returns_meta[i].requires_grad
+                # ]
+                # ctx.mark_non_differentiable(*fw_outs_not_requiring_grad)
+                # ctx._materialize_non_diff_grads = False
                 return tuple(raw_returns)
 
             @staticmethod
