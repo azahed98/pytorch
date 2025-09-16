@@ -308,158 +308,161 @@ def _create_runtime_wrapper(
             cm.__exit__(None, None, None)
 
     def runtime_wrapper(args: list[Any]):
-        # Create context manager for profiler
-        cm = record_runtime_wrapper_prologue_enter()
-
-        # stash a ref to each input tensor we plan to use after the compiled function
-        orig_inputs = {i: args[i] for i in epilogue_args_idx}
-
-        if keep_input_mutations:
-            mutated_args = (
-                args[i]
-                for i in runtime_metadata.mutated_graph_handled_indices_seen_by_autograd
-            )
-            torch.autograd.graph.increment_version(mutated_args)
-
-        if trace_joint:
-            args_ = list(args)
-            # See Note [Detaching inputs that never need gradients]
-            for idx in indices_of_inps_to_detach:
-                if isinstance(args_[idx], torch.Tensor):
-                    args_[idx] = args_[idx].detach()
-
-            # It's possible to have trace_joint inside user specified with no_grad() region,
-            # if there is a nested with enable_grad(), that forces some outputs to require gradients.
-            # Therefore, we unconditionally turn on enable_grad() for compiled_fn execution.
-            with (
-                torch.autograd._force_original_view_tracking(True),
-                torch.enable_grad(),
-            ):
-                record_runtime_wrapper_prologue_exit(cm)
-                all_outs = call_func_at_runtime_with_args(
-                    compiled_fn, args_, disable_amp=disable_amp, steal_args=True
-                )
-        else:
-            # When we have an inference graph, we run with grad disabled.
-            # It's possible to get an inference graph with inputs that require grad,
-            # in which case we want to make sure autograd is disabled
-            # (since e.g., inductor will generate aten.addmm.out calls which autograd will complain on)
-            # NOTE: We use _set_grad_enabled directly to reduce runtime overhead
-            grad_enabled = torch.is_grad_enabled()
-            try:
-                if grad_enabled:
-                    torch._C._set_grad_enabled(False)
-                record_runtime_wrapper_prologue_exit(cm)
-                all_outs = call_func_at_runtime_with_args(
-                    compiled_fn, args, disable_amp=disable_amp, steal_args=True
-                )
-            finally:
-                if grad_enabled:
-                    torch._C._set_grad_enabled(True)
-        del args
-
-        num_mutated_runtime_inps = runtime_metadata.num_mutated_inp_runtime_indices
-        num_intermediate_bases = runtime_metadata.num_intermediate_bases
-
-        assert (
-            len(all_outs)
-            == num_mutated_runtime_inps
-            + runtime_metadata.num_outputs
-            + num_intermediate_bases
+        return call_func_at_runtime_with_args(
+            compiled_fn, args, disable_amp=disable_amp, steal_args=True
         )
+        # # Create context manager for profiler
+        # cm = record_runtime_wrapper_prologue_enter()
 
-        # Step 3: After running the compiled fw, apply updates to mutated inputs
-        num_mutations_to_apply = runtime_metadata.num_mutated_inp_runtime_indices
-        if num_mutations_to_apply > 0:
-            updated_inputs = all_outs[:num_mutations_to_apply]
-            fw_outs = all_outs[num_mutations_to_apply:]
+        # # stash a ref to each input tensor we plan to use after the compiled function
+        # orig_inputs = {i: args[i] for i in epilogue_args_idx}
 
-            for i, inpt_idx in enumerate(runtime_metadata.mutated_inp_runtime_indices):
-                meta = runtime_metadata.input_info[inpt_idx]
-                if not meta.mutates_data and not meta.mutates_metadata:
-                    continue
-                original_inpt = orig_inputs[inpt_idx]
-                updated_inpt = updated_inputs[i]
-                if meta.mutates_storage_metadata:
-                    # See Note [set_() Input Mutations in AOTAutograd]
-                    # mutates_storage_metadata means our input saw a x.set_(y) call.
-                    # What if x **also** saw a data and/or a metadata mutation?
-                    # (1) If the [meta]data mutation occurred after the set_(),
-                    #     then there is no need to copy_() the data.
-                    #     When we perform x.set_(x_updated), we are guaranteed that
-                    #     x_updated already has the final version of the data/metadata
-                    # (2) If a data mutation occurred before the set_().
-                    #     This case seems very difficult to support.
-                    #     TODO: discuss on the PR and decide if we want to tr to
-                    #     either support it, or detect and ban it.
-                    if trace_joint:
-                        assert isinstance(updated_inpt, TensorAlias)
-                        updated_inpt = updated_inpt.alias
-                    with torch.no_grad():
-                        original_inpt.set_(updated_inpt)
-                    continue
-                if meta.mutates_metadata and not meta.mutates_data:
-                    if trace_joint:
-                        assert isinstance(updated_inpt, TensorAlias)
-                        updated_inpt = updated_inpt.alias
-                    # We need to grab the size/stride/storage_offset from the compiled forward,
-                    # and use that to mutate the metadata of the input
-                    original_inpt.as_strided_(
-                        updated_inpt.size(),
-                        updated_inpt.stride(),
-                        updated_inpt.storage_offset(),
-                    )
-                else:
-                    if meta.mutates_data and meta.mutates_metadata:
-                        original_inpt.as_strided_(
-                            updated_inpt.size(),
-                            updated_inpt.stride(),
-                            updated_inpt.storage_offset(),
-                        )
-                    else:
-                        assert meta.mutates_data
-                    if meta.is_leaf and original_inpt.requires_grad:
-                        # We can hit this situation in this case:
-                        #   def f(x):
-                        #       x.detach().mul_(2)
-                        #       return x + 1
-                        # AOTAutograd will see a mutation in the above case, and try to
-                        # apply a copy_() here, in the epilogue.
-                        # But if x required gradients, and is a leaf, then autograd
-                        # will yell at us for trying to mutate it.
-                        # However, it's only possible to end up in this scenario (like the above)
-                        # if all of the mutations to the leaf input were non-autograd-tracking mutations
-                        # (aka mutations under no_grad(), or on detached views).
-                        # In that case, we fully want to hide the mutation from autograd, so detaching is ok.
-                        original_inpt.detach().copy_(updated_inpt)
-                    else:
-                        original_inpt.copy_(updated_inpt)
-        else:
-            fw_outs = all_outs
+        # if keep_input_mutations:
+        #     mutated_args = (
+        #         args[i]
+        #         for i in runtime_metadata.mutated_graph_handled_indices_seen_by_autograd
+        #     )
+        #     torch.autograd.graph.increment_version(mutated_args)
 
-        # Step 4: Manually regenerate any outputs that are aliased to inputs, instead of
-        # compiling them.
-        if runtime_metadata.num_outputs_aliased > 0:
-            # The compiled forward also returned intermediate bases. We don't want to return them to the user.
-            expect_num_outputs = (
-                len(output_handlers) + runtime_metadata.num_intermediate_bases
-            )
-            assert len(fw_outs) == expect_num_outputs
-            ret_outs = [
-                handler(orig_inputs, fw_outs, out)
-                for out, handler in builtins.zip(fw_outs, output_handlers)
-            ]
-        else:
-            ret_outs = fw_outs
+        # if trace_joint:
+        #     args_ = list(args)
+        #     # See Note [Detaching inputs that never need gradients]
+        #     for idx in indices_of_inps_to_detach:
+        #         if isinstance(args_[idx], torch.Tensor):
+        #             args_[idx] = args_[idx].detach()
 
-        if runtime_metadata.dynamic_outputs:
-            for t, o in zip(ret_outs, runtime_metadata.output_info):
-                if o.dynamic_dims is None:
-                    continue
-                maybe_mark_dynamic_helper(t, o.dynamic_dims)
-        if runtime_metadata.grad_enabled_mutation is not None:
-            torch._C._set_grad_enabled(runtime_metadata.grad_enabled_mutation)
-        return ret_outs
+        #     # It's possible to have trace_joint inside user specified with no_grad() region,
+        #     # if there is a nested with enable_grad(), that forces some outputs to require gradients.
+        #     # Therefore, we unconditionally turn on enable_grad() for compiled_fn execution.
+        #     with (
+        #         torch.autograd._force_original_view_tracking(True),
+        #         torch.enable_grad(),
+        #     ):
+        #         record_runtime_wrapper_prologue_exit(cm)
+        #         all_outs = call_func_at_runtime_with_args(
+        #             compiled_fn, args_, disable_amp=disable_amp, steal_args=True
+        #         )
+        # else:
+        #     # When we have an inference graph, we run with grad disabled.
+        #     # It's possible to get an inference graph with inputs that require grad,
+        #     # in which case we want to make sure autograd is disabled
+        #     # (since e.g., inductor will generate aten.addmm.out calls which autograd will complain on)
+        #     # NOTE: We use _set_grad_enabled directly to reduce runtime overhead
+        #     grad_enabled = torch.is_grad_enabled()
+        #     try:
+        #         if grad_enabled:
+        #             torch._C._set_grad_enabled(False)
+        #         record_runtime_wrapper_prologue_exit(cm)
+        #         all_outs = call_func_at_runtime_with_args(
+        #             compiled_fn, args, disable_amp=disable_amp, steal_args=True
+        #         )
+        #     finally:
+        #         if grad_enabled:
+        #             torch._C._set_grad_enabled(True)
+        # del args
+
+        # num_mutated_runtime_inps = runtime_metadata.num_mutated_inp_runtime_indices
+        # num_intermediate_bases = runtime_metadata.num_intermediate_bases
+
+        # assert (
+        #     len(all_outs)
+        #     == num_mutated_runtime_inps
+        #     + runtime_metadata.num_outputs
+        #     + num_intermediate_bases
+        # )
+
+        # # Step 3: After running the compiled fw, apply updates to mutated inputs
+        # num_mutations_to_apply = runtime_metadata.num_mutated_inp_runtime_indices
+        # if num_mutations_to_apply > 0:
+        #     updated_inputs = all_outs[:num_mutations_to_apply]
+        #     fw_outs = all_outs[num_mutations_to_apply:]
+
+        #     for i, inpt_idx in enumerate(runtime_metadata.mutated_inp_runtime_indices):
+        #         meta = runtime_metadata.input_info[inpt_idx]
+        #         if not meta.mutates_data and not meta.mutates_metadata:
+        #             continue
+        #         original_inpt = orig_inputs[inpt_idx]
+        #         updated_inpt = updated_inputs[i]
+        #         if meta.mutates_storage_metadata:
+        #             # See Note [set_() Input Mutations in AOTAutograd]
+        #             # mutates_storage_metadata means our input saw a x.set_(y) call.
+        #             # What if x **also** saw a data and/or a metadata mutation?
+        #             # (1) If the [meta]data mutation occurred after the set_(),
+        #             #     then there is no need to copy_() the data.
+        #             #     When we perform x.set_(x_updated), we are guaranteed that
+        #             #     x_updated already has the final version of the data/metadata
+        #             # (2) If a data mutation occurred before the set_().
+        #             #     This case seems very difficult to support.
+        #             #     TODO: discuss on the PR and decide if we want to tr to
+        #             #     either support it, or detect and ban it.
+        #             if trace_joint:
+        #                 assert isinstance(updated_inpt, TensorAlias)
+        #                 updated_inpt = updated_inpt.alias
+        #             with torch.no_grad():
+        #                 original_inpt.set_(updated_inpt)
+        #             continue
+        #         if meta.mutates_metadata and not meta.mutates_data:
+        #             if trace_joint:
+        #                 assert isinstance(updated_inpt, TensorAlias)
+        #                 updated_inpt = updated_inpt.alias
+        #             # We need to grab the size/stride/storage_offset from the compiled forward,
+        #             # and use that to mutate the metadata of the input
+        #             original_inpt.as_strided_(
+        #                 updated_inpt.size(),
+        #                 updated_inpt.stride(),
+        #                 updated_inpt.storage_offset(),
+        #             )
+        #         else:
+        #             if meta.mutates_data and meta.mutates_metadata:
+        #                 original_inpt.as_strided_(
+        #                     updated_inpt.size(),
+        #                     updated_inpt.stride(),
+        #                     updated_inpt.storage_offset(),
+        #                 )
+        #             else:
+        #                 assert meta.mutates_data
+        #             if meta.is_leaf and original_inpt.requires_grad:
+        #                 # We can hit this situation in this case:
+        #                 #   def f(x):
+        #                 #       x.detach().mul_(2)
+        #                 #       return x + 1
+        #                 # AOTAutograd will see a mutation in the above case, and try to
+        #                 # apply a copy_() here, in the epilogue.
+        #                 # But if x required gradients, and is a leaf, then autograd
+        #                 # will yell at us for trying to mutate it.
+        #                 # However, it's only possible to end up in this scenario (like the above)
+        #                 # if all of the mutations to the leaf input were non-autograd-tracking mutations
+        #                 # (aka mutations under no_grad(), or on detached views).
+        #                 # In that case, we fully want to hide the mutation from autograd, so detaching is ok.
+        #                 original_inpt.detach().copy_(updated_inpt)
+        #             else:
+        #                 original_inpt.copy_(updated_inpt)
+        # else:
+        #     fw_outs = all_outs
+
+        # # Step 4: Manually regenerate any outputs that are aliased to inputs, instead of
+        # # compiling them.
+        # if runtime_metadata.num_outputs_aliased > 0:
+        #     # The compiled forward also returned intermediate bases. We don't want to return them to the user.
+        #     expect_num_outputs = (
+        #         len(output_handlers) + runtime_metadata.num_intermediate_bases
+        #     )
+        #     assert len(fw_outs) == expect_num_outputs
+        #     ret_outs = [
+        #         handler(orig_inputs, fw_outs, out)
+        #         for out, handler in builtins.zip(fw_outs, output_handlers)
+        #     ]
+        # else:
+        #     ret_outs = fw_outs
+
+        # if runtime_metadata.dynamic_outputs:
+        #     for t, o in zip(ret_outs, runtime_metadata.output_info):
+        #         if o.dynamic_dims is None:
+        #             continue
+        #         maybe_mark_dynamic_helper(t, o.dynamic_dims)
+        # if runtime_metadata.grad_enabled_mutation is not None:
+        #     torch._C._set_grad_enabled(runtime_metadata.grad_enabled_mutation)
+        # return ret_outs
 
     if not (trace_joint and _should_disable_saved_tensors_hooks()):
         return runtime_wrapper
@@ -2082,159 +2085,165 @@ To fix this, your tensor subclass must implement the dunder method __force_to_sa
 
             @staticmethod
             def forward(ctx, *deduped_flat_tensor_args):
-                args = deduped_flat_tensor_args
-                if backward_state_indices:
-                    bw_state = args[backward_state_indices[0]]
-                    assert isinstance(bw_state, BackwardState)
-                    ctx._compiled_autograd_backward_state = bw_state
-
-                if num_rng:
-                    if len(fwd_rng_states) == 0:
-                        assert graphsafe_idx is not None
-                        initialize_rng_states(
-                            num_rng, graphsafe_idx, fwd_rng_states, bwd_rng_states
-                        )
-
-                    _curr_iter = next(curr_fwd_iter)
-                    ctx._curr_iter = _curr_iter
-
-                    # if this state is not contained in the backward,
-                    # we need to save it for when its backward pass happens
-                    if _curr_iter != backward_state_position:
-                        saved_backward_tensor_states[_curr_iter] = [
-                            rng_state.get_state() for rng_state in fwd_rng_states
-                        ]
-
-                    pending_forwards.add(_curr_iter)
-                    args = (*args, *fwd_rng_states)
-
-                # There is a pretty complicated calling convention around what the compiled fw returns.
-                # The full list of outputs and their relative order is:
-                # (*tokens, *mutated_inputs, *fw_outs, *fw_intermediate_bases, *saved_tensors, *saved_symints)
-                # - Note that in the synthetic bases case, mutated_inputs will correspond to an updated version
-                #   of the original view, and not the synthetic base
-                # - Note that donated buffer logic requires (*saved_tensors, *saved_symints) showing up last
-                #   in the fw output order.
-                fw_outs = call_func_at_runtime_with_args(
+                # args = deduped_flat_tensor_args
+                return call_func_at_runtime_with_args(
                     CompiledFunction.compiled_fw,
-                    args,
+                    deduped_flat_tensor_args,
                     disable_amp=disable_amp,
                 )
 
-                num_outputs = CompiledFunction.metadata.num_outputs
-                num_outputs_aliased = CompiledFunction.metadata.num_outputs_aliased
-                num_mutated_runtime_inps = (
-                    CompiledFunction.metadata.num_mutated_inp_runtime_indices
-                )
-                num_forward_returns = CompiledFunction.metadata.num_forward_returns
+                # if backward_state_indices:
+                #     bw_state = args[backward_state_indices[0]]
+                #     assert isinstance(bw_state, BackwardState)
+                #     ctx._compiled_autograd_backward_state = bw_state
 
-                # Partitioners must put symint arguments at the end separate from tensor arguments
-                tensors_saved_for_backwards = fw_outs[
-                    CompiledFunction.metadata.tensors_saved_for_backwards_slice
-                ]
-                assert all(
-                    isinstance(x, torch.Tensor) for x in tensors_saved_for_backwards
-                )
+                # if num_rng:
+                #     if len(fwd_rng_states) == 0:
+                #         assert graphsafe_idx is not None
+                #         initialize_rng_states(
+                #             num_rng, graphsafe_idx, fwd_rng_states, bwd_rng_states
+                #         )
 
-                def mark_dynamic_activations(activations: list[torch.Tensor]):
-                    for (
-                        idx,
-                        dims,
-                    ) in CompiledFunction.metadata.dynamic_saved_tensors_idxs.items():
-                        maybe_mark_dynamic_helper(activations[idx], dims)
-                    return activations
+                #     _curr_iter = next(curr_fwd_iter)
+                #     ctx._curr_iter = _curr_iter
 
-                # See Note [Detaching saved tensors in AOTAutograd]
-                ctx.save_for_backward(
-                    *mark_dynamic_activations(
-                        [
-                            x.detach() if x._is_view() else x
-                            for x in tensors_saved_for_backwards
-                        ]
-                    )
-                )
-                symint_outs = fw_outs[
-                    CompiledFunction.metadata.symints_saved_for_backwards_slice
-                ]
-                assert all(
-                    isinstance(x, (int, float, torch.SymInt, torch.SymFloat))
-                    for x in symint_outs
-                ), str([type(x) for x in symint_outs])
-                ctx.symints = symint_outs
+                #     # if this state is not contained in the backward,
+                #     # we need to save it for when its backward pass happens
+                #     if _curr_iter != backward_state_position:
+                #         saved_backward_tensor_states[_curr_iter] = [
+                #             rng_state.get_state() for rng_state in fwd_rng_states
+                #         ]
 
-                raw_returns = fw_outs[0:num_forward_returns]
+                #     pending_forwards.add(_curr_iter)
+                #     args = (*args, *fwd_rng_states)
 
-                # Wrap all autograd.Function.forward() outputs that are aliases
-                # so that autograd.Function doesn't treat them as tensors
-                if num_mutated_runtime_inps > 0:
-                    for i, idx in enumerate(
-                        CompiledFunction.metadata.mutated_inp_runtime_indices
-                    ):
-                        # We could make this faster by only looping over inputs with metadata-only mutations
-                        # (instead of looping over inputs with either data or metadata mutations), but there shouldn't be many.
-                        info = CompiledFunction.metadata.input_info[idx]
-                        if info.mutates_metadata and not info.mutates_data:
-                            raw_return_idx = i
-                            raw_returns[raw_return_idx] = TensorAlias(
-                                raw_returns[raw_return_idx]
-                            )
+                # # There is a pretty complicated calling convention around what the compiled fw returns.
+                # # The full list of outputs and their relative order is:
+                # # (*tokens, *mutated_inputs, *fw_outs, *fw_intermediate_bases, *saved_tensors, *saved_symints)
+                # # - Note that in the synthetic bases case, mutated_inputs will correspond to an updated version
+                # #   of the original view, and not the synthetic base
+                # # - Note that donated buffer logic requires (*saved_tensors, *saved_symints) showing up last
+                # #   in the fw output order.
+                # fw_outs = call_func_at_runtime_with_args(
+                #     CompiledFunction.compiled_fw,
+                #     args,
+                #     disable_amp=disable_amp,
+                # )
 
-                    if config.debug_assert:
-                        user_mutated_inputs_raw = raw_returns[
-                            0:num_mutated_runtime_inps
-                        ]
-                        mut_inp_infos = [
-                            x
-                            for x in CompiledFunction.metadata.input_info
-                            if x.mutates_data or x.mutates_metadata
-                        ]
-                        assert len(user_mutated_inputs_raw) == len(mut_inp_infos)
+                # num_outputs = CompiledFunction.metadata.num_outputs
+                # num_outputs_aliased = CompiledFunction.metadata.num_outputs_aliased
+                # num_mutated_runtime_inps = (
+                #     CompiledFunction.metadata.num_mutated_inp_runtime_indices
+                # )
+                # num_forward_returns = CompiledFunction.metadata.num_forward_returns
 
-                if CompiledFunction.metadata.num_unsafe_view_outputs > 0:
-                    for idx in CompiledFunction.metadata.unsafe_view_out_indices:
-                        raw_return_idx = num_mutated_runtime_inps + idx
-                        o = raw_returns[raw_return_idx]
-                        raw_returns[raw_return_idx] = torch.ops.aten._unsafe_view(
-                            o, o.shape
-                        )
+                # # Partitioners must put symint arguments at the end separate from tensor arguments
+                # tensors_saved_for_backwards = fw_outs[
+                #     CompiledFunction.metadata.tensors_saved_for_backwards_slice
+                # ]
+                # assert all(
+                #     isinstance(x, torch.Tensor) for x in tensors_saved_for_backwards
+                # )
 
-                if num_outputs_aliased > 0:
-                    for idx in CompiledFunction.metadata.aliased_out_indices:
-                        raw_return_idx = num_mutated_runtime_inps + idx
-                        raw_returns[raw_return_idx] = TensorAlias(
-                            raw_returns[raw_return_idx]
-                        )
+                # def mark_dynamic_activations(activations: list[torch.Tensor]):
+                #     for (
+                #         idx,
+                #         dims,
+                #     ) in CompiledFunction.metadata.dynamic_saved_tensors_idxs.items():
+                #         maybe_mark_dynamic_helper(activations[idx], dims)
+                #     return activations
 
-                    if config.debug_assert:
-                        intermediates_raw = raw_returns[
-                            num_mutated_runtime_inps + num_outputs :
-                        ]
-                        assert not any(
-                            isinstance(x, TensorAlias) for x in intermediates_raw
-                        )
+                # # See Note [Detaching saved tensors in AOTAutograd]
+                # ctx.save_for_backward(
+                #     *mark_dynamic_activations(
+                #         [
+                #             x.detach() if x._is_view() else x
+                #             for x in tensors_saved_for_backwards
+                #         ]
+                #     )
+                # )
+                # symint_outs = fw_outs[
+                #     CompiledFunction.metadata.symints_saved_for_backwards_slice
+                # ]
+                # assert all(
+                #     isinstance(x, (int, float, torch.SymInt, torch.SymFloat))
+                #     for x in symint_outs
+                # ), str([type(x) for x in symint_outs])
+                # ctx.symints = symint_outs
 
-                # invariant: intermediate bases always require gradients, so we don't have to
-                # consider marking them as non-differentiable.
-                raw_returns_not_including_intermediate_bases = raw_returns[
-                    : num_mutated_runtime_inps + num_outputs
-                ]
-                raw_returns_meta = [
-                    x
-                    for x in CompiledFunction.metadata.input_info
-                    if x.mutation_type == MutationType.MUTATED_OUT_GRAPH
-                ] + CompiledFunction.metadata.output_info
+                # raw_returns = fw_outs[0:num_forward_returns]
 
-                fw_outs_not_requiring_grad = [
-                    x
-                    for (i, x) in enumerate(
-                        raw_returns_not_including_intermediate_bases
-                    )
-                    if isinstance(x, torch.Tensor)
-                    and not raw_returns_meta[i].requires_grad
-                ]
-                ctx.mark_non_differentiable(*fw_outs_not_requiring_grad)
-                ctx._materialize_non_diff_grads = False
-                return tuple(raw_returns)
+                # # Wrap all autograd.Function.forward() outputs that are aliases
+                # # so that autograd.Function doesn't treat them as tensors
+                # if num_mutated_runtime_inps > 0:
+                #     for i, idx in enumerate(
+                #         CompiledFunction.metadata.mutated_inp_runtime_indices
+                #     ):
+                #         # We could make this faster by only looping over inputs with metadata-only mutations
+                #         # (instead of looping over inputs with either data or metadata mutations), but there shouldn't be many.
+                #         info = CompiledFunction.metadata.input_info[idx]
+                #         if info.mutates_metadata and not info.mutates_data:
+                #             raw_return_idx = i
+                #             raw_returns[raw_return_idx] = TensorAlias(
+                #                 raw_returns[raw_return_idx]
+                #             )
+
+                #     if config.debug_assert:
+                #         user_mutated_inputs_raw = raw_returns[
+                #             0:num_mutated_runtime_inps
+                #         ]
+                #         mut_inp_infos = [
+                #             x
+                #             for x in CompiledFunction.metadata.input_info
+                #             if x.mutates_data or x.mutates_metadata
+                #         ]
+                #         assert len(user_mutated_inputs_raw) == len(mut_inp_infos)
+
+                # if CompiledFunction.metadata.num_unsafe_view_outputs > 0:
+                #     for idx in CompiledFunction.metadata.unsafe_view_out_indices:
+                #         raw_return_idx = num_mutated_runtime_inps + idx
+                #         o = raw_returns[raw_return_idx]
+                #         raw_returns[raw_return_idx] = torch.ops.aten._unsafe_view(
+                #             o, o.shape
+                #         )
+
+                # if num_outputs_aliased > 0:
+                #     for idx in CompiledFunction.metadata.aliased_out_indices:
+                #         raw_return_idx = num_mutated_runtime_inps + idx
+                #         raw_returns[raw_return_idx] = TensorAlias(
+                #             raw_returns[raw_return_idx]
+                #         )
+
+                #     if config.debug_assert:
+                #         intermediates_raw = raw_returns[
+                #             num_mutated_runtime_inps + num_outputs :
+                #         ]
+                #         assert not any(
+                #             isinstance(x, TensorAlias) for x in intermediates_raw
+                #         )
+
+                # # invariant: intermediate bases always require gradients, so we don't have to
+                # # consider marking them as non-differentiable.
+                # raw_returns_not_including_intermediate_bases = raw_returns[
+                #     : num_mutated_runtime_inps + num_outputs
+                # ]
+                # raw_returns_meta = [
+                #     x
+                #     for x in CompiledFunction.metadata.input_info
+                #     if x.mutation_type == MutationType.MUTATED_OUT_GRAPH
+                # ] + CompiledFunction.metadata.output_info
+
+                # fw_outs_not_requiring_grad = [
+                #     x
+                #     for (i, x) in enumerate(
+                #         raw_returns_not_including_intermediate_bases
+                #     )
+                #     if isinstance(x, torch.Tensor)
+                #     and not raw_returns_meta[i].requires_grad
+                # ]
+                # ctx.mark_non_differentiable(*fw_outs_not_requiring_grad)
+                # ctx._materialize_non_diff_grads = False
+                # return tuple(raw_returns)
 
             @staticmethod
             def backward(ctx, *flat_args):
