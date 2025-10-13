@@ -2200,16 +2200,16 @@ class VariableBuilder:
         if isinstance(source, GradSource) and is_from_optimizer_source(source):
             guard_type = GuardBuilder.NOT_NONE_MATCH
 
-        self.install_guards(
-            functools.partial(
-                guard_type,
-                value=(
-                    value
-                    if isinstance(source, NumpyTensorSource)
-                    else TensorWeakRef(value)
-                ),
-            )
-        )
+        # self.install_guards(
+        #     functools.partial(
+        #         guard_type,
+        #         value=(
+        #             value
+        #             if isinstance(source, NumpyTensorSource)
+        #             else TensorWeakRef(value)
+        #         ),
+        #     )
+        # )
 
         # We install TYPE_MATCH guards for traceable wrapper subclass object,
         # and recursively install corresponding guard for each inner attribute.

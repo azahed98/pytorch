@@ -2198,6 +2198,19 @@ class OutputGraph(OutputGraphCommon):
                 # This is safe because we pre-process name to be unique
                 self.install_global_unsafe(name, compiled_fn)
 
+            # cleanup old_fake_mode
+
+            import weakref
+            from torch.utils.weak import WeakIdKeyDictionary
+
+
+            # del old_fake_mode.fake_tensor_converter.meta_converter.tensor_memo
+            # old_fake_mode.fake_tensor_converter.meta_converter.tensor_memo = weakref.WeakValueDictionary()
+            # del old_fake_mode.fake_tensor_converter.meta_converter.describer.lookup_tensor
+            # old_fake_mode.fake_tensor_converter.meta_converter.describer.lookup_tensor = WeakIdKeyDictionary()
+            # del old_fake_mode.fake_tensor_converter.meta_converter.describer.lookup_storage
+            # old_fake_mode.fake_tensor_converter.meta_converter.describer.lookup_storage = WeakIdKeyDictionary()
+
             assert self.root_tx is not None
             cg = PyCodegen(self.root_tx)
 

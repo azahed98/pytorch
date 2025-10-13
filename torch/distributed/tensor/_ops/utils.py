@@ -157,6 +157,7 @@ def normalize_dims(dims: DimsType, ndim: int) -> DimsSequenceType:
 def prod(xs: Iterable[int]) -> int:
     return functools.reduce(operator.mul, xs, 1)
 
+from torch.fx.experimental.symbolic_shapes import guard_or_false, guard_or_true
 
 def is_tensor_shardable(shape: Sequence[int], spec: DTensorSpec) -> bool:
     """Check if the shape is shardable according to the spec."""
@@ -172,7 +173,7 @@ def is_tensor_shardable(shape: Sequence[int], spec: DTensorSpec) -> bool:
     for i, dim_size in enumerate(shape):
         # TODO: maybe we should determine is_shardable based on
         #       whether it's evenly sharded or not
-        if shards_map[i] > 1 and dim_size < shards_map[i]:
+        if shards_map[i] > 1 and guard_or_true(dim_size < shards_map[i]):
             return False
 
     return True

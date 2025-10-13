@@ -1039,6 +1039,7 @@ def compile_context(
         _TLS.compile_context = old_context
 
 
+
 @contextmanager
 def tracing(
     context: Optional[TracingContext],
@@ -1065,6 +1066,22 @@ def tracing(
             and context.fake_mode.shape_env is not None
         ):
             context.fake_mode.shape_env.cleanup()
+        # if context is not None and context.fake_mode is not None:
+        #     # breakpoint()
+        #     import weakref
+        #     import gc
+        #     from torch.utils.weak import WeakIdKeyDictionary
+        #     del context.fake_mode.fake_tensor_converter.meta_converter.tensor_memo
+        #     context.fake_mode.fake_tensor_converter.meta_converter.tensor_memo = weakref.WeakValueDictionary()
+        #     del context.fake_mode.fake_tensor_converter.meta_converter.describer.lookup_tensor
+        #     context.fake_mode.fake_tensor_converter.meta_converter.describer.lookup_tensor = WeakIdKeyDictionary()
+        #     del context.fake_mode.fake_tensor_converter.meta_converter.describer.lookup_storage
+        #     context.fake_mode.fake_tensor_converter.meta_converter.describer.lookup_storage = WeakIdKeyDictionary()
+
+        #     gc.collect()
+        if context is not None:
+            del context.tensor_to_context
+            context.tensor_to_context = WeakTensorKeyDictionary()
         _TLS.tracing_context = old_context
 
 

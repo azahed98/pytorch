@@ -3748,19 +3748,19 @@ class CheckFunctionManager:
             "pytorch/compiler:guard_nn_modules"
         )
 
-        for guard in sorted_guards:
-            if (
-                not guard_on_nn_modules
-                and guard.is_specialized_nn_module()
-                # Default func args must be guarded on.
-                # TODO: we could make use of 'DefaultsSource' and offer a .guard.is_defaults() API
-                and "__defaults__" not in guard.name
-                and "__kwdefaults__" not in guard.name
-                and (config.skip_nnmodule_hook_guards or "hooks" not in guard.name)
-            ):
-                continue
+        # for guard in sorted_guards:
+        #     if (
+        #         not guard_on_nn_modules
+        #         and guard.is_specialized_nn_module()
+        #         # Default func args must be guarded on.
+        #         # TODO: we could make use of 'DefaultsSource' and offer a .guard.is_defaults() API
+        #         and "__defaults__" not in guard.name
+        #         and "__kwdefaults__" not in guard.name
+        #         and (config.skip_nnmodule_hook_guards or "hooks" not in guard.name)
+        #     ):
+        #         continue
 
-            guard.create(builder)
+        #     guard.create(builder)
         return builder, guard_manager
 
     def compile_check_fn(
