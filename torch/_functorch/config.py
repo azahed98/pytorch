@@ -405,6 +405,12 @@ joint_custom_pass: Callable = None  # type: ignore[assignment]
 # on to explicitly annotate. This is currently only used by inductor lite mode.
 selective_decompose: bool = False
 
+# When True, use code generation for AOTAutograd runtime wrappers instead of
+# interpretive wrappers. This can reduce overhead for small compiled graphs.
+# See https://github.com/pytorch/pytorch/issues/161783
+# Currently only supports inference mode (not training).
+codegen_wrappers: bool = False
+
 
 if TYPE_CHECKING:
     from torch.utils._config_typing import *  # noqa: F401, F403

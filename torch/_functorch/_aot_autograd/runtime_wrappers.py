@@ -260,6 +260,22 @@ def _create_runtime_wrapper(
     if not getattr(compiled_fn, "_boxed_call", False):
         compiled_fn = make_boxed_func(compiled_fn)
 
+    # Try codegen path if enabled
+    if config.codegen_wrappers:
+        from .wrapper_codegen import maybe_codegen_runtime_wrapper
+
+        codegen_wrapper = maybe_codegen_runtime_wrapper(
+            compiled_fn,
+            runtime_metadata,
+            indices_of_inps_to_detach,
+            trace_joint,
+            keep_input_mutations,
+            disable_amp,
+        )
+        if codegen_wrapper is not None:
+            return codegen_wrapper
+        # Fall through to interpretive wrapper if codegen not supported
+
     # Note [Inputs needed in runtime epilogue after list clearing]
     # In Python functions, you can't free the input arguments of a function within the scope of that function. A workaround is to
     # wrap the input arguments in a list, and clear the list from within the function.
