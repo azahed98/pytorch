@@ -342,7 +342,7 @@ class FakeTensorConverter:
         tid = self.meta_converter.describer.lookup_tensor.get(t)
         if tid is None:
             return None
-        from torch._subclasses.meta_utils import make_tensor_memo_key
+        from torch._subclasses.meta_utils import make_tensor_memo_key, safe_is_leaf
 
         # Extract subclass type and ctx if applicable
         tensor_type = None
@@ -354,14 +354,30 @@ class FakeTensorConverter:
             except Exception:
                 pass
 
+        # Get stride if available (not available for sparse tensors)
+        stride = None
+        try:
+            stride = tuple(t.stride())
+        except RuntimeError:
+            pass
+
         key = make_tensor_memo_key(
-            tid, tuple(t.shape), t.dtype, t.device, tensor_type, ctx
+            tid,
+            tuple(t.shape),
+            stride,
+            t.storage_offset() if stride is not None else 0,
+            t.dtype,
+            t.device,
+            t.requires_grad,
+            safe_is_leaf(t),
+            tensor_type,
+            ctx,
         )
         return self.tensor_memo.get(key)
 
     def set_tensor_memo(self, t: Tensor, v: FakeTensor) -> None:
         tid = self.meta_converter.describer.get_tensor_id(t)
-        from torch._subclasses.meta_utils import make_tensor_memo_key
+        from torch._subclasses.meta_utils import make_tensor_memo_key, safe_is_leaf
 
         # Extract subclass type and ctx if applicable
         tensor_type = None
@@ -373,8 +389,24 @@ class FakeTensorConverter:
             except Exception:
                 pass
 
+        # Get stride if available (not available for sparse tensors)
+        stride = None
+        try:
+            stride = tuple(t.stride())
+        except RuntimeError:
+            pass
+
         key = make_tensor_memo_key(
-            tid, tuple(t.shape), t.dtype, t.device, tensor_type, ctx
+            tid,
+            tuple(t.shape),
+            stride,
+            t.storage_offset() if stride is not None else 0,
+            t.dtype,
+            t.device,
+            t.requires_grad,
+            safe_is_leaf(t),
+            tensor_type,
+            ctx,
         )
         self.meta_converter.tensor_memo[key] = v
 

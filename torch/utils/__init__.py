@@ -125,3 +125,49 @@ def swap_tensors(t1, t2):
 
     # Swap the at::Tensor they point to
     torch._C._swap_tensor_impl(t1, t2)
+
+    # Swap tensor_to_context entries in TracingContext if active.
+    # This ensures that if t1 had a symbolic context for its OLD shape,
+    # it now gets t2's symbolic context (which matches t1's NEW shape).
+    # See note [Tensor Fakification and Symbol Caching] in symbolic_shapes.py.
+    _swap_tensor_to_context(t1, t2)
+
+
+def _swap_tensor_to_context(t1, t2):
+    """
+    Swap the tensor_to_context entries for t1 and t2 in the active TracingContext.
+
+    After swap_tensors(t1, t2), t1 has t2's metadata and vice versa. The symbolic
+    context stored in tensor_to_context should also be swapped to maintain the
+    invariant that tensor_to_context[tensor] returns the context matching the
+    tensor's current shape.
+    """
+    try:
+        tracing_context = torch._guards.TracingContext.try_get()
+    except Exception:
+        # No tracing context available
+        return
+
+    if tracing_context is None:
+        return
+
+    tensor_to_context = tracing_context.tensor_to_context
+
+    # Get existing contexts (may be None if tensor was never traced)
+    ctx1 = tensor_to_context.get(t1)
+    ctx2 = tensor_to_context.get(t2)
+
+    # Swap the contexts
+    if ctx1 is not None and ctx2 is not None:
+        # Both have contexts - swap them
+        tensor_to_context[t1] = ctx2
+        tensor_to_context[t2] = ctx1
+    elif ctx1 is not None:
+        # Only t1 had context - move it to t2, remove from t1
+        tensor_to_context[t2] = ctx1
+        del tensor_to_context[t1]
+    elif ctx2 is not None:
+        # Only t2 had context - move it to t1, remove from t2
+        tensor_to_context[t1] = ctx2
+        del tensor_to_context[t2]
+    # If neither has context, nothing to do
