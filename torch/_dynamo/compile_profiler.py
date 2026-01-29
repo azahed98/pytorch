@@ -31,6 +31,19 @@ Usage:
     tracer = trace_function("compile_check_fn")
     # ... run code ...
     tracer.report()
+
+    # Profile specific regions inside user code during tracing
+    from torch._dynamo.compile_profiler import ProfileTracedRegion, get_traced_region_report
+
+    class MyModel(nn.Module):
+        def forward(self, x):
+            with ProfileTracedRegion("attention_block"):
+                x = self.attention(x)
+            return x
+
+    compiled = torch.compile(MyModel())
+    compiled(input)
+    get_traced_region_report()
 """
 
 from __future__ import annotations
@@ -458,10 +471,16 @@ class ProfileSession:
             return self
 
         # Check if trampoline already active
+        # Note: Cannot activate trampoline while Dynamo's eval frame is active
         if _trampoline_available():
             self._trampoline_was_active = sys.is_stack_trampoline_active()
             if not self._trampoline_was_active:
-                sys.activate_stack_trampoline("perf")
+                try:
+                    sys.activate_stack_trampoline("perf")
+                except RuntimeError:
+                    # Trampoline conflicts with Dynamo's eval frame - skip it
+                    # C++ symbols will still be captured, just Python names may be less readable
+                    self._trampoline_was_active = True  # Don't try to deactivate
 
         # Build perf command
         cmd = [
@@ -918,6 +937,7 @@ class FunctionCall:
     start_ns: int
     end_ns: int
     duration_ns: int
+    stack: Optional[list[str]] = None  # Call stack if captured
 
 
 @dataclass
@@ -1188,3 +1208,284 @@ def profile_region(name: str = "region"):
         yield timer
     finally:
         timer.end_ns = time.perf_counter_ns()
+
+
+# =============================================================================
+# Traced Region Profiling
+# =============================================================================
+# This allows profiling specific regions of user code during Dynamo tracing.
+
+
+class _TracedRegionState:
+    """Global state for traced region profiling."""
+
+    def __init__(self) -> None:
+        self.active_regions: dict[str, float] = {}  # name -> start_time
+        self.completed_regions: dict[str, list[float]] = {}  # name -> [durations]
+        self.function_tracer: Optional[FunctionTracer] = None
+        self.trace_targets: list[str] = []
+        # Perf profiling state
+        self.perf_sessions: dict[str, ProfileSession] = {}  # name -> active session
+        self.perf_results: dict[str, ProfileSession] = {}  # name -> completed session
+        self.perf_config: dict[str, dict[str, Any]] = {}  # name -> perf config
+
+    def enter_region(
+        self,
+        name: str,
+        perf: bool = False,
+        perf_output: Optional[str] = None,
+        perf_frequency: int = 999,
+        perf_call_graph: str = "dwarf",
+    ) -> None:
+        """Called when tracing enters a profiled region."""
+        self.active_regions[name] = time.perf_counter_ns()
+
+        # Start function tracing if configured
+        if self.function_tracer is None and self.trace_targets:
+            self.function_tracer = FunctionTracer()
+            for target in self.trace_targets:
+                self.function_tracer.trace(target)
+
+        # Start perf profiling if configured
+        if perf:
+            output = perf_output or f"{name}_trace.perf"
+            session = ProfileSession(
+                output=output,
+                frequency=perf_frequency,
+                call_graph=perf_call_graph,
+            )
+            session.__enter__()
+            self.perf_sessions[name] = session
+            self.perf_config[name] = {
+                "output": output,
+                "frequency": perf_frequency,
+                "call_graph": perf_call_graph,
+            }
+
+    def exit_region(self, name: str) -> float:
+        """Called when tracing exits a profiled region. Returns duration in ms."""
+        if name not in self.active_regions:
+            return 0.0
+
+        start = self.active_regions.pop(name)
+        duration_ms = (time.perf_counter_ns() - start) / 1e6
+
+        if name not in self.completed_regions:
+            self.completed_regions[name] = []
+        self.completed_regions[name].append(duration_ms)
+
+        # Stop perf session if active
+        if name in self.perf_sessions:
+            session = self.perf_sessions.pop(name)
+            session.__exit__(None, None, None)
+            self.perf_results[name] = session
+
+        return duration_ms
+
+    def is_in_region(self, name: Optional[str] = None) -> bool:
+        """Check if we're currently in any (or a specific) profiled region."""
+        if name is None:
+            return bool(self.active_regions)
+        return name in self.active_regions
+
+    def report(self) -> None:
+        """Print report of all profiled regions."""
+        if not self.completed_regions and not self.perf_results:
+            print("No traced regions recorded")
+            return
+
+        print("\nTraced Region Profiling Report")
+        print("=" * 50)
+        for name, durations in self.completed_regions.items():
+            total = sum(durations)
+            avg = total / len(durations)
+            print(f"\n{name}:")
+            print(f"  Traces: {len(durations)}")
+            print(f"  Total:  {total:.2f}ms")
+            print(f"  Avg:    {avg:.2f}ms")
+            if len(durations) > 1:
+                print(f"  Min:    {min(durations):.2f}ms")
+                print(f"  Max:    {max(durations):.2f}ms")
+
+            # Show perf results if available
+            if name in self.perf_results:
+                print(f"\n  Perf profile: {self.perf_config.get(name, {}).get('output', 'N/A')}")
+
+        if self.function_tracer:
+            self.function_tracer.report()
+
+        # Show perf profile summaries
+        for name, session in self.perf_results.items():
+            print(f"\n{'=' * 50}")
+            print(f"Perf Profile for '{name}':")
+            print("=" * 50)
+            session.print_stats(limit=10)
+
+    def get_perf_session(self, name: str) -> Optional[ProfileSession]:
+        """Get the perf session for a completed region."""
+        return self.perf_results.get(name)
+
+    def clear(self) -> None:
+        """Clear all recorded data."""
+        self.active_regions.clear()
+        self.completed_regions.clear()
+        self.perf_sessions.clear()
+        self.perf_results.clear()
+        self.perf_config.clear()
+        if self.function_tracer:
+            self.function_tracer.stop()
+            self.function_tracer = None
+
+
+# Global state for traced region profiling
+_traced_region_state = _TracedRegionState()
+
+
+class ProfileTracedRegion:
+    """
+    Context manager to profile Dynamo tracing of a specific region of user code.
+
+    Place this inside your model's forward() method to profile only the
+    compilation of that specific region.
+
+    Usage:
+        from torch._dynamo.compile_profiler import ProfileTracedRegion, get_traced_region_report
+
+        class MyModel(nn.Module):
+            def forward(self, x):
+                x = self.layer1(x)
+
+                with ProfileTracedRegion("attention_block"):
+                    x = self.attention(x)
+
+                x = self.layer2(x)
+                return x
+
+        model = MyModel()
+        compiled = torch.compile(model)
+        compiled(input)  # This triggers tracing
+
+        get_traced_region_report()  # Print profiling results
+
+    You can also trace specific functions within the region:
+        with ProfileTracedRegion("attention", trace=["wrap_fx_proxy", "run_node"]):
+            x = self.attention(x)
+
+    For full C++/Python callstacks using Linux perf:
+        with ProfileTracedRegion("attention", perf=True):
+            x = self.attention(x)
+
+        # After compilation, access the perf session:
+        session = get_traced_region_perf("attention")
+        session.print_stats()
+        session.print_stats(category="interpreter")  # Filter by category
+    """
+
+    # Class variable to track if Dynamo integration is set up
+    _dynamo_integrated = False
+
+    def __init__(
+        self,
+        name: str = "region",
+        trace: Optional[list[str]] = None,
+        perf: bool = False,
+        perf_output: Optional[str] = None,
+        perf_frequency: int = 999,
+        perf_call_graph: str = "dwarf",
+    ):
+        """
+        Args:
+            name: Name for this profiled region
+            trace: List of function names to trace within this region
+            perf: If True, run Linux perf to capture C++/Python callstacks
+            perf_output: Output file for perf data (default: {name}_trace.perf)
+            perf_frequency: Sampling frequency in Hz (default: 999)
+            perf_call_graph: "dwarf" for accurate stacks or "fp" for faster
+        """
+        self.name = name
+        self.trace_targets = trace or []
+        self.perf = perf
+        self.perf_output = perf_output
+        self.perf_frequency = perf_frequency
+        self.perf_call_graph = perf_call_graph
+        self._start_time: float = 0.0
+
+    def __enter__(self) -> "ProfileTracedRegion":
+        # During eager execution, just track time
+        self._start_time = time.perf_counter_ns()
+
+        # If we're being traced by Dynamo, this is called during tracing
+        # and we want to record the tracing time
+        _traced_region_state.trace_targets = self.trace_targets
+        _traced_region_state.enter_region(
+            self.name,
+            perf=self.perf,
+            perf_output=self.perf_output,
+            perf_frequency=self.perf_frequency,
+            perf_call_graph=self.perf_call_graph,
+        )
+
+        return self
+
+    def __exit__(
+        self,
+        exc_type: Optional[type[BaseException]],
+        exc_val: Optional[BaseException],
+        exc_tb: Any,
+    ) -> None:
+        duration = _traced_region_state.exit_region(self.name)
+        if duration > 0:
+            # We were being traced
+            pass
+
+    @property
+    def duration_ms(self) -> float:
+        """Get duration of the last completed trace of this region."""
+        durations = _traced_region_state.completed_regions.get(self.name, [])
+        return durations[-1] if durations else 0.0
+
+
+def get_traced_region_report() -> None:
+    """Print the profiling report for all traced regions."""
+    _traced_region_state.report()
+
+
+def clear_traced_regions() -> None:
+    """Clear all traced region profiling data."""
+    _traced_region_state.clear()
+
+
+def get_traced_region_stats(name: str) -> dict[str, Any]:
+    """
+    Get statistics for a specific traced region.
+
+    Returns:
+        Dict with 'traces', 'total_ms', 'avg_ms', 'min_ms', 'max_ms'
+    """
+    durations = _traced_region_state.completed_regions.get(name, [])
+    if not durations:
+        return {"traces": 0, "total_ms": 0.0, "avg_ms": 0.0}
+
+    return {
+        "traces": len(durations),
+        "total_ms": sum(durations),
+        "avg_ms": sum(durations) / len(durations),
+        "min_ms": min(durations),
+        "max_ms": max(durations),
+    }
+
+
+def get_traced_region_perf(name: str) -> Optional[ProfileSession]:
+    """
+    Get the perf ProfileSession for a traced region.
+
+    This allows you to analyze the perf results in detail:
+        session = get_traced_region_perf("attention")
+        session.print_stats()  # Top symbols
+        session.print_stats(category="interpreter")  # Filter by category
+        session.analyze_caller("dynamo")  # Analyze by caller
+
+    Returns:
+        ProfileSession if perf was enabled for this region, None otherwise.
+    """
+    return _traced_region_state.get_perf_session(name)

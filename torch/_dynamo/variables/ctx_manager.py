@@ -1057,6 +1057,116 @@ class ProfilerContextVariable(ContextWrappingVariable):
         )
 
 
+class CompileProfilerContextVariable(ContextWrappingVariable):
+    """
+    Handles ProfileTracedRegion from torch._dynamo.compile_profiler.
+
+    During tracing, this records timing of the traced region. In the compiled
+    graph, it behaves like nullcontext (no overhead at runtime).
+    """
+
+    _nonvar_fields = {
+        "region_name",
+        "trace_targets",
+        "perf",
+        "perf_output",
+        "perf_frequency",
+        "perf_call_graph",
+        *ContextWrappingVariable._nonvar_fields,
+    }
+
+    @staticmethod
+    def create(
+        region_name: str,
+        trace_targets: Optional[list[str]] = None,
+        perf: bool = False,
+        perf_output: Optional[str] = None,
+        perf_frequency: int = 999,
+        perf_call_graph: str = "dwarf",
+        **kwargs: Any,
+    ) -> "CompileProfilerContextVariable":
+        return CompileProfilerContextVariable(
+            region_name=region_name,
+            trace_targets=trace_targets or [],
+            perf=perf,
+            perf_output=perf_output,
+            perf_frequency=perf_frequency,
+            perf_call_graph=perf_call_graph,
+            **kwargs,
+        )
+
+    def __init__(
+        self,
+        region_name: str = "region",
+        trace_targets: Optional[list[str]] = None,
+        perf: bool = False,
+        perf_output: Optional[str] = None,
+        perf_frequency: int = 999,
+        perf_call_graph: str = "dwarf",
+        **kwargs: Any,
+    ) -> None:
+        kwargs.pop("target_values", None)  # Remove if passed
+        super().__init__(target_values=None, **kwargs)
+        self.region_name = region_name
+        self.trace_targets = trace_targets or []
+        self.perf = perf
+        self.perf_output = perf_output
+        self.perf_frequency = perf_frequency
+        self.perf_call_graph = perf_call_graph
+
+    def enter(self, tx: "InstructionTranslator") -> VariableTracker:
+        # Import here to avoid circular imports
+        from torch._dynamo.compile_profiler import _traced_region_state
+
+        # Record the start of this traced region
+        _traced_region_state.trace_targets = self.trace_targets
+        _traced_region_state.enter_region(
+            self.region_name,
+            perf=self.perf,
+            perf_output=self.perf_output,
+            perf_frequency=self.perf_frequency,
+            perf_call_graph=self.perf_call_graph,
+        )
+
+        # Return self for use in "as" clause, but it will be nullcontext at runtime
+        return self
+
+    def exit(
+        self, tx: "InstructionTranslator", *args: VariableTracker
+    ) -> VariableTracker:
+        # Import here to avoid circular imports
+        from torch._dynamo.compile_profiler import _traced_region_state
+
+        # Stop function tracing for this region
+        if _traced_region_state.function_tracer is not None:
+            _traced_region_state.function_tracer.stop()
+
+        # Record the end of this traced region
+        duration = _traced_region_state.exit_region(self.region_name)
+        log.debug(
+            "CompileProfiler: region '%s' traced in %.2fms",
+            self.region_name,
+            duration,
+        )
+
+        return variables.ConstantVariable.create(None)
+
+    def module_name(self) -> str:
+        return "contextlib"
+
+    def fn_name(self) -> str:
+        return "nullcontext"
+
+    def reconstruct(self, codegen: "PyCodegen") -> None:
+        # Reconstruct as nullcontext - no overhead at runtime
+        codegen.add_push_null(
+            lambda: codegen(
+                AttrSource(codegen.tx.import_source("contextlib"), "nullcontext")
+            )
+        )
+        codegen.extend_output(codegen.create_call_function_kw([], False))
+
+
 class ProfilerRecordFunctionContextVariable(ContextWrappingVariable):
     """
     This class represents torch profiler context objects.

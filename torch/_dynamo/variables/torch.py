@@ -78,6 +78,7 @@ from ..utils import (
 from .base import raise_type_error_exc, typestr, VariableTracker
 from .ctx_manager import (
     AutocastModeVariable,
+    CompileProfilerContextVariable,
     ProfilerContextVariable,
     ProfilerRecordFunctionContextVariable,
     TorchFunctionDisableVariable,
@@ -116,6 +117,27 @@ T = TypeVar("T")
 
 log = logging.getLogger(__name__)
 
+
+def _is_compile_profiler_traced_region(value: Any) -> bool:
+    """Check if value is ProfileTracedRegion from compile_profiler."""
+    try:
+        from torch._dynamo.compile_profiler import ProfileTracedRegion
+
+        return value is ProfileTracedRegion
+    except ImportError:
+        return False
+
+
+def _get_compile_profiler_traced_region() -> Optional[type]:
+    """Get ProfileTracedRegion class if available."""
+    try:
+        from torch._dynamo.compile_profiler import ProfileTracedRegion
+
+        return ProfileTracedRegion
+    except ImportError:
+        return None
+
+
 supported_ctx_manager_classes = dict.fromkeys(
     [
         torch.profiler.profiler.profile,
@@ -149,6 +171,11 @@ supported_ctx_manager_classes = dict.fromkeys(
         torch.nn.attention.sdpa_kernel.__wrapped__,  # type: ignore[attr-defined]
     ]
 )
+
+# Add ProfileTracedRegion from compile_profiler if available
+_ptr_cls = _get_compile_profiler_traced_region()
+if _ptr_cls is not None:
+    supported_ctx_manager_classes[_ptr_cls] = None
 
 
 REWRITE_OPS_TO_TENSOR_SIZE_METHOD = dict.fromkeys(
@@ -540,6 +567,36 @@ class TorchCtxManagerClassVariable(BaseTorchVariable):
         ):
             warning_once(log, "Profiler function %s will be ignored", self.value)
             return ProfilerContextVariable()
+        elif _is_compile_profiler_traced_region(self.value):
+            # Handle ProfileTracedRegion from torch._dynamo.compile_profiler
+            region_name = "region"
+            trace_targets: list[str] = []
+            perf = False
+            perf_output = None
+            perf_frequency = 999
+            perf_call_graph = "dwarf"
+
+            if args:
+                region_name = args[0].as_python_constant()
+            if "trace" in kwargs:
+                trace_targets = kwargs["trace"].as_python_constant()
+            if "perf" in kwargs:
+                perf = kwargs["perf"].as_python_constant()
+            if "perf_output" in kwargs:
+                perf_output = kwargs["perf_output"].as_python_constant()
+            if "perf_frequency" in kwargs:
+                perf_frequency = kwargs["perf_frequency"].as_python_constant()
+            if "perf_call_graph" in kwargs:
+                perf_call_graph = kwargs["perf_call_graph"].as_python_constant()
+
+            return CompileProfilerContextVariable.create(
+                region_name=region_name,
+                trace_targets=trace_targets,
+                perf=perf,
+                perf_output=perf_output,
+                perf_frequency=perf_frequency,
+                perf_call_graph=perf_call_graph,
+            )
         elif (
             self.value is torch._C.DisableTorchFunctionSubclass
             or self.value is torch._C.DisableTorchFunction
