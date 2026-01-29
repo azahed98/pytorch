@@ -12,6 +12,15 @@ Usage:
         compiled(x)
     p.print_stats()
 
+    # Filter by category (interpreter, gc, dict, attr, guards, tensor, dynamo)
+    p.print_stats(category="gc")
+
+    # Filter by caller function (only samples under a specific frame)
+    p.print_stats(caller="compile_check_fn")
+
+    # Combine filters
+    p.print_stats(category="dict", caller="compile_check_fn")
+
     # Decorator
     @profile("test.perf")
     def test_compile():
@@ -41,6 +50,18 @@ if TYPE_CHECKING:
     from types import FrameType
 
 
+# Categories for filtering and grouping
+CATEGORY_PATTERNS: dict[str, list[str]] = {
+    "interpreter": ["pyeval", "evalframe", "_PyFunction_Vectorcall", "_PyEval_"],
+    "gc": ["deduce_unreachable", "visit_", "gc_collect", "untrack_", "_PyGC_"],
+    "dict": ["dict_lookup", "dict_get", "dict_set", "_PyDict_", "lookdict"],
+    "attr": ["getattr", "setattr", "_PyObject_GenericGetAttr", "PyObject_GetAttr"],
+    "guards": ["guard", "check_nopybind", "GuardManager", "CheckFunction"],
+    "tensor": ["TensorImpl", "aten::", "ATen", "c10::"],
+    "dynamo": ["_dynamo", "torch/dynamo", "torch._dynamo"],
+}
+
+
 @dataclass
 class ProfileSample:
     """A single sample from perf."""
@@ -49,6 +70,22 @@ class ProfileSample:
     symbol: str
     library: str
     is_kernel: bool = False
+    stack: list[str] = field(default_factory=list)  # Full call stack if available
+
+    def get_category(self) -> str:
+        """Determine the category of this sample."""
+        sym_lower = self.symbol.lower()
+        lib_lower = self.library.lower()
+        combined = f"{sym_lower} {lib_lower}"
+
+        if self.is_kernel:
+            return "kernel"
+
+        for category, patterns in CATEGORY_PATTERNS.items():
+            if any(p.lower() in combined for p in patterns):
+                return category
+
+        return "other"
 
 
 @dataclass
@@ -63,6 +100,7 @@ class ProfileStats:
     def print_stats(
         self,
         filter: Optional[str] = None,
+        category: Optional[str] = None,
         limit: int = 20,
         show_kernel: bool = True,
     ) -> None:
@@ -71,62 +109,220 @@ class ProfileStats:
 
         Args:
             filter: Only show symbols containing this string (case-insensitive)
+            category: Only show samples in this category
+                      (interpreter, gc, dict, attr, guards, tensor, dynamo, kernel, other)
             limit: Maximum number of entries to show
             show_kernel: Whether to include kernel symbols
         """
         print(f"\nProfile: {self.perf_data_path}")
-        print(f"Duration: {self.duration_ms:.1f}ms, Samples: {self.total_samples}\n")
-        print(f"{'%':>6}  {'Symbol':<50} Library")
-        print("-" * 75)
+        print(f"Duration: {self.duration_ms:.1f}ms, Samples: {self.total_samples}")
+
+        if category:
+            print(f"Filtering by category: {category}")
+        if filter:
+            print(f"Filtering by: '{filter}'")
+        print()
+
+        print(f"{'%':>6}  {'Cat':<6}  {'Symbol':<44} Library")
+        print("-" * 80)
 
         count = 0
+        filtered_pct = 0.0
         for sample in self.samples:
+            sample_cat = sample.get_category()
+
             if filter and filter.lower() not in sample.symbol.lower():
+                continue
+            if category and sample_cat != category:
                 continue
             if not show_kernel and sample.is_kernel:
                 continue
 
-            symbol_display = sample.symbol[:50]
-            lib_display = sample.library[:20]
-            print(f"{sample.percent:>5.1f}%  {symbol_display:<50} {lib_display}")
+            filtered_pct += sample.percent
+            symbol_display = sample.symbol[:44]
+            lib_display = sample.library[:16]
+            cat_display = sample_cat[:6]
+            print(f"{sample.percent:>5.1f}%  {cat_display:<6}  {symbol_display:<44} {lib_display}")
             count += 1
             if count >= limit:
+                remaining = sum(
+                    s.percent
+                    for s in self.samples[count:]
+                    if (not category or s.get_category() == category)
+                    and (not filter or filter.lower() in s.symbol.lower())
+                )
+                if remaining > 0:
+                    print(f"  ... and {remaining:.1f}% more")
                 break
 
         if count == 0:
             print("  (no matching samples)")
+        elif category or filter:
+            print(f"\nTotal in filter: {filtered_pct:.1f}%")
 
     def top_by_category(self) -> dict[str, float]:
         """Group samples by category and return percentages."""
-        categories: dict[str, float] = {
-            "interpreter": 0.0,
-            "gc": 0.0,
-            "dict": 0.0,
-            "guards": 0.0,
-            "kernel": 0.0,
-            "other": 0.0,
-        }
-
-        gc_symbols = {"deduce_unreachable", "visit_", "gc_collect", "untrack_"}
-        guard_symbols = {"guard", "check_nopybind"}
+        categories: dict[str, float] = {}
+        for cat in list(CATEGORY_PATTERNS.keys()) + ["kernel", "other"]:
+            categories[cat] = 0.0
 
         for sample in self.samples:
-            sym_lower = sample.symbol.lower()
-
-            if sample.is_kernel:
-                categories["kernel"] += sample.percent
-            elif "pyeval" in sym_lower or "evalframe" in sym_lower:
-                categories["interpreter"] += sample.percent
-            elif any(gc in sym_lower for gc in gc_symbols):
-                categories["gc"] += sample.percent
-            elif "dict" in sym_lower:
-                categories["dict"] += sample.percent
-            elif any(g in sym_lower for g in guard_symbols):
-                categories["guards"] += sample.percent
-            else:
-                categories["other"] += sample.percent
+            cat = sample.get_category()
+            categories[cat] = categories.get(cat, 0.0) + sample.percent
 
         return categories
+
+    def filter_by_caller(self, caller: str) -> "ProfileStats":
+        """
+        Return a new ProfileStats with only samples that occurred under a specific caller.
+
+        This requires that samples have stack information (call_graph mode was used).
+
+        Args:
+            caller: Function name or pattern to match in the call stack
+
+        Returns:
+            New ProfileStats with filtered samples, percentages recalculated
+        """
+        filtered = [s for s in self.samples if self._sample_under_caller(s, caller)]
+
+        if not filtered:
+            return ProfileStats(
+                samples=[],
+                total_samples=0,
+                duration_ms=self.duration_ms,
+                perf_data_path=self.perf_data_path,
+            )
+
+        # Recalculate percentages relative to filtered set
+        total_pct = sum(s.percent for s in filtered)
+        if total_pct > 0:
+            scale = 100.0 / total_pct
+            new_samples = [
+                ProfileSample(
+                    percent=s.percent * scale,
+                    symbol=s.symbol,
+                    library=s.library,
+                    is_kernel=s.is_kernel,
+                    stack=s.stack,
+                )
+                for s in filtered
+            ]
+        else:
+            new_samples = filtered
+
+        return ProfileStats(
+            samples=new_samples,
+            total_samples=len(new_samples),
+            duration_ms=self.duration_ms,
+            perf_data_path=self.perf_data_path + f" [caller={caller}]",
+        )
+
+    def _sample_under_caller(self, sample: ProfileSample, caller: str) -> bool:
+        """Check if sample occurred while caller was on the stack."""
+        caller_lower = caller.lower()
+
+        # Check the stack if available
+        if sample.stack:
+            return any(caller_lower in frame.lower() for frame in sample.stack)
+
+        # Fallback: check if symbol itself matches
+        return caller_lower in sample.symbol.lower()
+
+    def analyze_by_caller(self, caller: str) -> dict[str, Any]:
+        """
+        Analyze samples by caller directly from the perf data.
+
+        This parses perf script output and counts how many samples
+        occurred while the caller was on the stack.
+
+        Args:
+            caller: Function name pattern to match
+
+        Returns:
+            Dict with 'total_samples', 'under_caller', 'top_symbols' (counter)
+        """
+        if not self.perf_data_path or not os.path.exists(
+            self.perf_data_path.split()[0]
+        ):
+            return {"total_samples": 0, "under_caller": 0}
+
+        perf_file = self.perf_data_path.split()[0]  # Handle "[caller=x]" suffix
+        try:
+            # Use -F to get better symbol output
+            result = subprocess.run(
+                ["perf", "script", "-i", perf_file, "-F", "comm,ip,sym,dso"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            return {"total_samples": 0, "under_caller": 0}
+
+        caller_lower = caller.lower()
+        total_samples = 0
+        under_caller = 0
+        symbol_counts: dict[str, int] = {}
+        current_stack: list[str] = []
+        in_sample = False
+
+        for line in result.stdout.split("\n"):
+            stripped = line.rstrip()
+
+            if stripped and not stripped.startswith(("\t", " ")):
+                # New sample - process previous
+                if current_stack:
+                    total_samples += 1
+                    if any(caller_lower in frame.lower() for frame in current_stack):
+                        under_caller += 1
+                        # Count top symbol (extract full symbol name)
+                        if current_stack:
+                            top = self._extract_symbol_from_frame(current_stack[0])
+                            symbol_counts[top] = symbol_counts.get(top, 0) + 1
+                current_stack = []
+                in_sample = True
+            elif in_sample and stripped.startswith(("\t", " ")):
+                current_stack.append(stripped)
+            elif not stripped:
+                in_sample = False
+
+        # Handle last sample
+        if current_stack:
+            total_samples += 1
+            if any(caller_lower in frame.lower() for frame in current_stack):
+                under_caller += 1
+
+        return {
+            "total_samples": total_samples,
+            "under_caller": under_caller,
+            "top_symbols": symbol_counts,
+        }
+
+    @staticmethod
+    def _extract_symbol_from_frame(frame: str) -> str:
+        """
+        Extract the symbol name from a perf script frame line.
+
+        Frame format: "    7fa9b5ac21a _PyEval_EvalFrameDefault (/path/to/python)"
+        """
+        parts = frame.strip().split()
+        if len(parts) < 2:
+            return frame.strip()
+
+        # parts[0] is the address, parts[1] is the symbol
+        symbol = parts[1]
+
+        # If symbol is [unknown], try to use the DSO name
+        if symbol == "[unknown]" and len(parts) >= 3:
+            # Get DSO from (path/to/lib)
+            dso = " ".join(parts[2:])
+            if "(" in dso:
+                dso = dso.split("(")[-1].rstrip(")")
+                # Extract just the filename
+                dso = dso.split("/")[-1]
+                return f"[{dso}]"
+
+        return symbol
 
     def print_summary(self) -> None:
         """Print a high-level summary by category."""
@@ -336,6 +532,7 @@ class ProfileSession:
 
     def _parse_results(self, duration_ms: float) -> ProfileStats:
         """Parse perf report output into ProfileStats."""
+        # First get the flat report for percentages
         result = subprocess.run(
             ["perf", "report", "--stdio", "-i", self.output],
             capture_output=True,
@@ -375,6 +572,10 @@ class ProfileSession:
             except (ValueError, IndexError):
                 continue
 
+        # Try to get stack information for caller filtering
+        if self.call_graph in ("dwarf", "fp"):
+            self._enrich_with_stacks(samples)
+
         return ProfileStats(
             samples=samples,
             total_samples=len(samples),
@@ -382,16 +583,155 @@ class ProfileSession:
             perf_data_path=self.output,
         )
 
+    def _enrich_with_stacks(self, samples: list[ProfileSample]) -> None:
+        """
+        Enrich samples with stack information from perf script.
+
+        This allows filtering by caller function.
+        """
+        try:
+            result = subprocess.run(
+                ["perf", "script", "-i", self.output],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            return
+
+        # Parse all samples from perf script and build symbol -> stacks map
+        # perf script format:
+        #   python 12345 [000] 12345.678901: cycles:
+        #       7fff12345678 symbol1+0x10 (library1)
+        #       7fff12345679 symbol2+0x20 (library2)
+        #       ...
+        symbol_stacks: dict[str, list[list[str]]] = {}
+        current_stack: list[str] = []
+        in_sample = False
+
+        for line in result.stdout.split("\n"):
+            stripped = line.rstrip()
+
+            # Detect sample header (not indented, contains process info)
+            if stripped and not stripped.startswith(("\t", " ")):
+                # Save previous sample
+                if current_stack:
+                    self._save_stack(symbol_stacks, current_stack)
+                current_stack = []
+                in_sample = True
+            elif in_sample and (stripped.startswith("\t") or stripped.startswith(" ")):
+                # Stack frame line
+                # Format: "\t7fff12345678 symbol+0x10 (/path/to/lib)"
+                # Or:    "            7fff12345678 symbol+0x10 (/path/to/lib)"
+                parts = stripped.split()
+                if len(parts) >= 2:
+                    # Extract full frame info including library path
+                    frame_info = " ".join(parts[1:])  # Everything after address
+                    current_stack.append(frame_info)
+            elif not stripped:
+                # Empty line - end of sample
+                if current_stack:
+                    self._save_stack(symbol_stacks, current_stack)
+                current_stack = []
+                in_sample = False
+
+        # Handle last sample
+        if current_stack:
+            self._save_stack(symbol_stacks, current_stack)
+
+        # Associate stacks with samples (match by symbol name)
+        for sample in samples:
+            base_symbol = sample.symbol.split("+")[0]
+            if base_symbol in symbol_stacks and symbol_stacks[base_symbol]:
+                sample.stack = symbol_stacks[base_symbol][0]
+
+    def _save_stack(
+        self, symbol_stacks: dict[str, list[list[str]]], stack: list[str]
+    ) -> None:
+        """Save a stack trace, keyed by the top (sampled) symbol."""
+        if not stack:
+            return
+        # Extract symbol from first frame (format: "symbol+0x10 (/path/to/lib)")
+        top_frame = stack[0]
+        # Symbol is before '+' or space
+        if "+" in top_frame:
+            top_symbol = top_frame.split("+")[0]
+        else:
+            top_symbol = top_frame.split()[0] if " " in top_frame else top_frame
+
+        if top_symbol not in symbol_stacks:
+            symbol_stacks[top_symbol] = []
+        symbol_stacks[top_symbol].append(stack.copy())
+
     def print_stats(
         self,
         filter: Optional[str] = None,
+        category: Optional[str] = None,
+        caller: Optional[str] = None,
         limit: int = 20,
     ) -> None:
-        """Print profiling results."""
-        if self._stats:
-            self._stats.print_stats(filter=filter, limit=limit)
-        else:
+        """
+        Print profiling results.
+
+        Args:
+            filter: Only show symbols containing this string
+            category: Only show samples in this category
+                      (interpreter, gc, dict, attr, guards, tensor, dynamo, kernel, other)
+            caller: Only show samples that occurred under this function
+            limit: Maximum entries to show
+        """
+        if not self._stats:
             print("No profiling data available")
+            return
+
+        stats = self._stats
+        if caller:
+            # Use analyze_by_caller for more reliable results
+            analysis = stats.analyze_by_caller(caller)
+            under_caller = analysis.get("under_caller", 0)
+            total = analysis.get("total_samples", 0)
+
+            if under_caller == 0:
+                print(f"No samples found under caller '{caller}'")
+                print("Note: caller filtering requires call graph mode (dwarf/fp)")
+                return
+
+            # Get top symbols and create synthetic stats for display
+            top_symbols = analysis.get("top_symbols", {})
+            print(f"\nProfile: {stats.perf_data_path} [caller={caller}]")
+            print(f"Samples under '{caller}': {under_caller}/{total} ({100*under_caller/max(1,total):.1f}%)\n")
+
+            if category:
+                print(f"Filtering by category: {category}")
+            if filter:
+                print(f"Filtering by: '{filter}'")
+
+            print(f"{'%':>6}  {'Symbol':<50}")
+            print("-" * 60)
+
+            count = 0
+            for sym, sym_count in sorted(top_symbols.items(), key=lambda x: -x[1]):
+                pct = 100 * sym_count / max(1, under_caller)
+
+                # Apply filters
+                if filter and filter.lower() not in sym.lower():
+                    continue
+                if category:
+                    # Create temp sample to check category
+                    temp = ProfileSample(percent=pct, symbol=sym, library="")
+                    if temp.get_category() != category:
+                        continue
+
+                print(f"{pct:>5.1f}%  {sym[:50]}")
+                count += 1
+                if count >= limit:
+                    break
+
+            if count == 0:
+                print("  (no matching samples after filtering)")
+            return
+
+        stats.print_stats(filter=filter, category=category, limit=limit)
 
     def print_summary(self) -> None:
         """Print high-level summary by category."""
@@ -399,6 +739,51 @@ class ProfileSession:
             self._stats.print_summary()
         else:
             print("No profiling data available")
+
+    def filter_by_caller(self, caller: str) -> Optional[ProfileStats]:
+        """
+        Get samples that occurred under a specific caller function.
+
+        Args:
+            caller: Function name or pattern to match in call stacks
+
+        Returns:
+            New ProfileStats with filtered samples, or None if no data
+        """
+        if not self._stats:
+            return None
+        return self._stats.filter_by_caller(caller)
+
+    def analyze_caller(self, caller: str) -> None:
+        """
+        Analyze and print statistics for samples under a specific caller.
+
+        This directly parses perf script output for more reliable results.
+
+        Args:
+            caller: Function name or pattern to match in call stacks
+        """
+        if not self._stats:
+            print("No profiling data available")
+            return
+
+        result = self._stats.analyze_by_caller(caller)
+        total = result.get("total_samples", 0)
+        under = result.get("under_caller", 0)
+        symbols = result.get("top_symbols", {})
+
+        print(f"\nCaller Analysis: {caller}")
+        print("=" * 50)
+        print(f"Total samples:    {total}")
+        print(f"Under '{caller}': {under} ({100*under/max(1,total):.1f}%)")
+
+        if symbols:
+            print(f"\nTop symbols under {caller}:")
+            print("-" * 40)
+            sorted_syms = sorted(symbols.items(), key=lambda x: -x[1])[:15]
+            for sym, count in sorted_syms:
+                pct = 100 * count / max(1, under)
+                print(f"  {pct:>5.1f}%  {sym}")
 
     def export_flamegraph(self, output_path: str) -> bool:
         """Generate flame graph SVG."""
