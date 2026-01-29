@@ -950,6 +950,23 @@ class FunctionStats:
             return 0.0
         return max(c.duration_ns for c in self.calls) / 1e6
 
+    def slowest_calls(self, n: int = 5) -> list[tuple[int, float]]:
+        """Get the N slowest calls with their index and duration in ms."""
+        if not self.calls:
+            return []
+        indexed = [(i, c.duration_ns / 1e6) for i, c in enumerate(self.calls)]
+        indexed.sort(key=lambda x: -x[1])
+        return indexed[:n]
+
+    def percentile_ms(self, p: float) -> float:
+        """Get the p-th percentile duration in ms (e.g., p=95 for 95th percentile)."""
+        if not self.calls:
+            return 0.0
+        durations = sorted(c.duration_ns for c in self.calls)
+        idx = int(len(durations) * p / 100)
+        idx = min(idx, len(durations) - 1)
+        return durations[idx] / 1e6
+
 
 class FunctionTracer:
     """
@@ -1070,8 +1087,14 @@ class FunctionTracer:
             sys.monitoring.set_events(self._TOOL_ID, 0)
             self._monitoring_active = False
 
-    def report(self) -> None:
-        """Print timing report for all traced functions."""
+    def report(self, show_outliers: bool = True) -> None:
+        """
+        Print timing report for all traced functions.
+
+        Args:
+            show_outliers: If True, show the slowest individual calls when
+                          max/avg ratio is high (indicates outliers)
+        """
         print("\nFunction Trace Report")
         print("=" * 50)
 
@@ -1086,6 +1109,14 @@ class FunctionTracer:
             print(f"  Avg:    {stats.avg_ms:.2f}ms")
             print(f"  Min:    {stats.min_ms:.2f}ms")
             print(f"  Max:    {stats.max_ms:.2f}ms")
+
+            # Show outliers if max is much larger than avg (indicates hot spots)
+            if show_outliers and stats.count > 1 and stats.max_ms > stats.avg_ms * 3:
+                print(f"  P95:    {stats.percentile_ms(95):.2f}ms")
+                print(f"  Slowest calls:")
+                for idx, duration in stats.slowest_calls(3):
+                    pct_of_total = 100 * duration / stats.total_ms
+                    print(f"    #{idx}: {duration:.2f}ms ({pct_of_total:.1f}% of total)")
 
     def get_stats(self, func_name: str) -> Optional[FunctionStats]:
         """Get statistics for a specific function."""
