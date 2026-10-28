@@ -14,6 +14,7 @@
 #include <torch/csrc/DynamicTypes.h>
 #include <torch/csrc/autograd/grad_mode.h>
 #include <torch/csrc/autograd/utils/wrap_outputs.h>
+#include <torch/csrc/dynamo/cpp_shim.h>
 #include <torch/csrc/dynamo/guards.h>
 #include <torch/csrc/inductor/inductor_ops.h>
 #include <torch/csrc/utils/disable_torch_function.h>
@@ -336,6 +337,19 @@ std::string TensorCheck::check_verbose(
 }
 
 namespace {
+
+class GuardRecordFunctionScope {
+ public:
+  explicit GuardRecordFunctionScope(const char* name)
+      : state(_pytorch_record_function_enter(name)) {}
+
+  ~GuardRecordFunctionScope() {
+    _pytorch_record_function_exit(state);
+  }
+
+ private:
+  _PytorchRecordFunctionState* state;
+};
 
 typedef std::vector<TensorCheck> ChecksList;
 
@@ -4043,7 +4057,25 @@ class GuardManager {
     bool result = true;
     bool failed_on_first = true;
     for (const auto& accessor : _accessors) {
-      if (!accessor->check_nopybind(value, matches_dict_tag)) { // early exit
+      bool accessor_result;
+      if (reinterpret_cast<void*>(this) == reinterpret_cast<void*>(_root)) {
+        const std::string source = accessor->get_source();
+        if (source == "L['input_ids']") {
+          GuardRecordFunctionScope rf("TorchDynamo Guard Input Subtree");
+          accessor_result = accessor->check_nopybind(value, matches_dict_tag);
+        } else if (source == "G") {
+          GuardRecordFunctionScope rf("TorchDynamo Guard Globals Subtree");
+          accessor_result = accessor->check_nopybind(value, matches_dict_tag);
+        } else if (source == "L['model']") {
+          GuardRecordFunctionScope rf("TorchDynamo Guard Model Subtree");
+          accessor_result = accessor->check_nopybind(value, matches_dict_tag);
+        } else {
+          accessor_result = accessor->check_nopybind(value, matches_dict_tag);
+        }
+      } else {
+        accessor_result = accessor->check_nopybind(value, matches_dict_tag);
+      }
+      if (!accessor_result) { // early exit
         _fail_count += 1;
         result = false;
         // need to sort, so break the loop.
@@ -4382,9 +4414,12 @@ class RootGuardManager : public GuardManager {
       _local_state = state;
     }
 
-    if (!GuardManager::check_leaf_guards_nopybind(value)) {
-      _reset_relational_guard_state();
-      return false;
+    {
+      GuardRecordFunctionScope rf("TorchDynamo Guard Root Leaves");
+      if (!GuardManager::check_leaf_guards_nopybind(value)) {
+        _reset_relational_guard_state();
+        return false;
+      }
     }
 
     // Run accessor guards without TorchFunction enabled
@@ -4396,18 +4431,24 @@ class RootGuardManager : public GuardManager {
     at::impl::PythonTorchFunctionTLS::set_disabled_state(
         at::impl::TorchFunctionDisabledState::ALL_DISABLED);
 
-    if (!GuardManager::check_accessors_nopybind(value)) {
-      at::impl::PythonTorchFunctionTLS::set_disabled_state(old_state);
-      _reset_relational_guard_state();
-      return false;
-    }
-
-    // Iterate over epilogue leaf guards.
-    for (const auto& guard : _epilogue_lambda_guards) {
-      if (!guard->check_nopybind(value)) { // early exit
+    {
+      GuardRecordFunctionScope rf("TorchDynamo Guard Accessors");
+      if (!GuardManager::check_accessors_nopybind(value)) {
         at::impl::PythonTorchFunctionTLS::set_disabled_state(old_state);
         _reset_relational_guard_state();
         return false;
+      }
+    }
+
+    // Iterate over epilogue leaf guards.
+    {
+      GuardRecordFunctionScope rf("TorchDynamo Guard Epilogue");
+      for (const auto& guard : _epilogue_lambda_guards) {
+        if (!guard->check_nopybind(value)) { // early exit
+          at::impl::PythonTorchFunctionTLS::set_disabled_state(old_state);
+          _reset_relational_guard_state();
+          return false;
+        }
       }
     }
 

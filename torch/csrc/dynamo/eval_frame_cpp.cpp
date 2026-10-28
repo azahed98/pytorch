@@ -208,6 +208,8 @@ py::list _get_frame_value_stack_with_depth(
 
 static constexpr const char* cache_lookup_profiler_str =
     "TorchDynamo Cache Lookup";
+static constexpr const char* frame_locals_profiler_str =
+    "TorchDynamo Frame Locals";
 
 // Cache the random module to avoid calling py::module_::import("random") at
 // arbitrary points during execution. torch.package overrides the import
@@ -541,7 +543,10 @@ PyObject* dynamo__custom_eval_frame(
           &maybe_cached_code,
           &trace_annotation,
           is_skip_guard_eval_unsafe)) {
+    _PytorchRecordFunctionState* locals_rf =
+        _pytorch_record_function_enter(frame_locals_profiler_str);
     locals = std::make_unique<FrameLocalsMapping>(frame);
+    _pytorch_record_function_exit(locals_rf);
     _PytorchRecordFunctionState* rf =
         _pytorch_record_function_enter(cache_lookup_profiler_str);
     lookup(

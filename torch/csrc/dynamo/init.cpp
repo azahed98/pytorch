@@ -528,6 +528,7 @@ void initDynamoBindings(PyObject* torch) {
   m.def("_load_precompile_entry", &_load_precompile_entry);
   m.def("_debug_get_precompile_entries", &_debug_get_precompile_entries);
   m.def("_set_lru_cache", &_set_lru_cache);
+  m.def("_debug_guard_eval_timing", &_debug_guard_eval_timing);
   m.def(
       "_get_frame_value_stack_with_depth", &_get_frame_value_stack_with_depth);
   m.def("set_bytecode_debugger_callback", &set_bytecode_debugger_callback);

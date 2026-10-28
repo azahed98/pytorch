@@ -1,10 +1,13 @@
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <vector>
 
 #include <c10/util/Exception.h>
 #include <torch/csrc/dynamo/extra_state.h>
 
 #include <torch/csrc/dynamo/cache_entry.h>
+#include <torch/csrc/dynamo/cpp_shim.h>
 #include <torch/csrc/dynamo/debug_macros.h>
 #include <torch/csrc/dynamo/eval_frame.h>
 #include <torch/csrc/dynamo/framelocals_mapping.h>
@@ -18,6 +21,28 @@
 namespace {
 // Short-term fix for: https://github.com/pytorch/pytorch/issues/166926
 bool use_lru = true;
+std::atomic<uint64_t> guard_eval_calls{0};
+std::atomic<uint64_t> guard_eval_ns{0};
+
+class GuardEvaluationScope {
+ public:
+  GuardEvaluationScope()
+      : state(_pytorch_record_function_enter("TorchDynamo Guard Evaluation")),
+        start(std::chrono::steady_clock::now()) {}
+
+  ~GuardEvaluationScope() {
+    auto elapsed = std::chrono::steady_clock::now() - start;
+    guard_eval_ns.fetch_add(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count(),
+        std::memory_order_relaxed);
+    guard_eval_calls.fetch_add(1, std::memory_order_relaxed);
+    _pytorch_record_function_exit(state);
+  }
+
+ private:
+  _PytorchRecordFunctionState* state;
+  std::chrono::steady_clock::time_point start;
+};
 } // namespace
 
 Py_ssize_t extra_index = -1;
@@ -213,6 +238,7 @@ static CacheEntry* lookup_in_list(
 
     if (valid) {
       try {
+        GuardEvaluationScope guard_scope;
         if (is_skip_guard_eval_unsafe) {
           valid = cache_entry_has_no_guards(
                       cache_entry, /*is_skip_guard_eval_unsafe=*/true) ||
@@ -504,6 +530,22 @@ void _set_lru_cache(py::object boolean) {
   } else {
     use_lru = false;
   }
+}
+
+py::dict _debug_guard_eval_timing(bool reset) {
+  uint64_t calls;
+  uint64_t elapsed_ns;
+  if (reset) {
+    calls = guard_eval_calls.exchange(0, std::memory_order_relaxed);
+    elapsed_ns = guard_eval_ns.exchange(0, std::memory_order_relaxed);
+  } else {
+    calls = guard_eval_calls.load(std::memory_order_relaxed);
+    elapsed_ns = guard_eval_ns.load(std::memory_order_relaxed);
+  }
+  py::dict result;
+  result["calls"] = calls;
+  result["elapsed_ns"] = elapsed_ns;
+  return result;
 }
 
 py::list _debug_get_precompile_entries(const py::handle& code_obj) {
